@@ -16,10 +16,12 @@ Route::get('/', function () {
 |   src/api/auth/route.ts
 |
 | Paths:
-|   POST /auth/login    -> loginApi
-|   POST /auth/register -> registerApi
-|   POST /auth/logout   -> logoutApi
-|   GET  /auth/me       -> meApi
+|   POST /auth/login                    -> loginApi
+|   POST /auth/register                 -> registerApi
+|   POST /auth/logout                   -> logoutApi
+|   GET  /auth/me                       -> meApi
+|   POST /auth/email/resend-verification -> resendVerification
+|   GET  /auth/email/verify/{token}     -> verifyEmail
 |
 */
 
@@ -28,4 +30,10 @@ Route::prefix('auth')->group(function () {
     Route::post('register', [AuthController::class, 'register'])->name('auth.register');
     Route::post('logout', [AuthController::class, 'logout'])->name('auth.logout');
     Route::get('me', [AuthController::class, 'me'])->name('auth.me');
+
+    Route::post('email/resend-verification', [AuthController::class, 'resendVerification'])
+        ->name('auth.email.resend');
+
+    Route::get('email/verify/{token}', [AuthController::class, 'verifyEmail'])
+        ->name('auth.email.verify');
 });
