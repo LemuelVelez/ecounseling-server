@@ -12,8 +12,6 @@ class VerifyCsrfToken extends Middleware
      * These are called directly by the React SPA without a CSRF token.
      */
     protected $except = [
-        'auth/login',
-        'auth/register',
-        'auth/logout',
+        'auth/*',  // /auth/login, /auth/register, /auth/logout, /auth/me, etc.
     ];
 }

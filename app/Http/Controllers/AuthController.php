@@ -11,6 +11,33 @@ use Illuminate\Validation\Rules\Password;
 class AuthController extends Controller
 {
     /**
+     * Build CORS headers for the current request so the React SPA
+     * running on http://localhost:5173 can talk to this controller.
+     */
+    protected function corsHeaders(Request $request): array
+    {
+        $origin = $request->headers->get('Origin', '');
+
+        $allowedOrigins = [
+            // You can override this via FRONTEND_URL in .env
+            config('app.frontend_url', env('FRONTEND_URL', 'http://localhost:5173')),
+            'http://localhost:5173',
+            'http://127.0.0.1:5173',
+        ];
+
+        if ($origin && in_array($origin, $allowedOrigins, true)) {
+            return [
+                'Access-Control-Allow-Origin'      => $origin,
+                'Vary'                             => 'Origin',
+                'Access-Control-Allow-Credentials' => 'true',
+            ];
+        }
+
+        // If the Origin doesn't match, don't send ACAO
+        return [];
+    }
+
+    /**
      * Register a new user and log them in.
      */
     public function register(Request $request): JsonResponse
@@ -43,10 +70,12 @@ class AuthController extends Controller
         Auth::login($user);
         $request->session()->regenerate();
 
-        return response()->json([
-            'user'  => $user,
-            'token' => null,
-        ]);
+        return response()
+            ->json([
+                'user'  => $user,
+                'token' => null,
+            ], 201)
+            ->withHeaders($this->corsHeaders($request));
     }
 
     /**
@@ -60,17 +89,21 @@ class AuthController extends Controller
         ]);
 
         if (! Auth::attempt($credentials, true)) {
-            return response()->json([
-                'message' => 'Invalid email or password.',
-            ], 422);
+            return response()
+                ->json([
+                    'message' => 'Invalid email or password.',
+                ], 422)
+                ->withHeaders($this->corsHeaders($request));
         }
 
         $request->session()->regenerate();
 
-        return response()->json([
-            'user'  => $request->user(),
-            'token' => null,
-        ]);
+        return response()
+            ->json([
+                'user'  => $request->user(),
+                'token' => null,
+            ])
+            ->withHeaders($this->corsHeaders($request));
     }
 
     /**
@@ -81,14 +114,18 @@ class AuthController extends Controller
         $user = $request->user();
 
         if (! $user) {
-            return response()->json([
-                'message' => 'Unauthenticated.',
-            ], 401);
+            return response()
+                ->json([
+                    'message' => 'Unauthenticated.',
+                ], 401)
+                ->withHeaders($this->corsHeaders($request));
         }
 
-        return response()->json([
-            'user' => $user,
-        ]);
+        return response()
+            ->json([
+                'user' => $user,
+            ])
+            ->withHeaders($this->corsHeaders($request));
     }
 
     /**
@@ -101,8 +138,10 @@ class AuthController extends Controller
         $request->session()->invalidate();
         $request->session()->regenerateToken();
 
-        return response()->json([
-            'message' => 'Logged out.',
-        ]);
+        return response()
+            ->json([
+                'message' => 'Logged out.',
+            ])
+            ->withHeaders($this->corsHeaders($request));
     }
 }
