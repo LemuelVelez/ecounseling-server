@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\IntakeController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -36,4 +37,21 @@ Route::prefix('auth')->group(function () {
 
     Route::get('email/verify/{token}', [AuthController::class, 'verifyEmail'])
         ->name('auth.email.verify');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Student counseling intake routes
+|--------------------------------------------------------------------------
+|
+| These endpoints are called from:
+|   src/pages/dashboard/student/intake.tsx
+|
+| Paths:
+|   POST /student/intake -> store a new counseling request
+|
+*/
+
+Route::middleware('auth')->prefix('student')->group(function () {
+    Route::post('intake', [IntakeController::class, 'store'])->name('student.intake.store');
 });
