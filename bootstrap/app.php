@@ -12,19 +12,23 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         /**
-         * CSRF configuration for Laravel 12.
+         * CSRF configuration for Laravel 11/12 + React SPA.
          *
-         * DISABLE_CSRF_FOR_SPA=true  -> disable CSRF everywhere (DEV ONLY)
-         * DISABLE_CSRF_FOR_SPA=false -> only skip /auth/* JSON routes
+         * We keep CSRF enabled for normal web routes, but we skip CSRF
+         * validation for the JSON endpoints your SPA calls directly:
+         *   - /auth/*     (login, register, logout, me, etc.)
+         *   - /student/*  (e.g. /student/intake)
          *
-         * In your current .env you have:
-         *     DISABLE_CSRF_FOR_SPA=true
-         * so CSRF is effectively OFF for all routes while you’re developing.
+         * These routes are still protected by:
+         *   - The session cookie (sent with credentials: "include")
+         *   - The "auth" middleware on /student/* routes
          */
+
         $middleware->validateCsrfTokens(
-            except: env('DISABLE_CSRF_FOR_SPA', false)
-                ? ['*']        // dev: skip CSRF for all routes
-                : ['auth/*'], // prod: protect everything except JSON /auth routes
+            except: [
+                'auth/*',    // /auth/login, /auth/register, /auth/logout, /auth/me, etc.
+                'student/*', // ✅ /student/intake and other student endpoints from the SPA
+            ],
         );
     })
     ->withExceptions(function (Exceptions $exceptions): void {

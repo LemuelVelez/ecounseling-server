@@ -17,12 +17,12 @@ Route::get('/', function () {
 |   src/api/auth/route.ts
 |
 | Paths:
-|   POST /auth/login                    -> loginApi
-|   POST /auth/register                 -> registerApi
-|   POST /auth/logout                   -> logoutApi
-|   GET  /auth/me                       -> meApi
+|   POST /auth/login                     -> loginApi
+|   POST /auth/register                  -> registerApi
+|   POST /auth/logout                    -> logoutApi
+|   GET  /auth/me                        -> meApi
 |   POST /auth/email/resend-verification -> resendVerification
-|   GET  /auth/email/verify/{token}     -> verifyEmail
+|   GET  /auth/email/verify/{token}      -> verifyEmail
 |
 */
 
