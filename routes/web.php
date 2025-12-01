@@ -46,12 +46,23 @@ Route::prefix('auth')->group(function () {
 |
 | These endpoints are called from:
 |   src/pages/dashboard/student/intake.tsx
+|   src/pages/dashboard/student/appointments.tsx
 |
 | Paths:
-|   POST /student/intake -> store a new counseling request
+|   POST /student/intake                 -> store a new counseling request
+|   GET  /student/appointments           -> list counseling requests for the logged-in student
+|   PUT  /student/appointments/{intake}  -> update details for a specific request
 |
 */
 
 Route::middleware('auth')->prefix('student')->group(function () {
     Route::post('intake', [IntakeController::class, 'store'])->name('student.intake.store');
+
+    // List all counseling-related appointments/requests for the authenticated student.
+    Route::get('appointments', [IntakeController::class, 'appointments'])
+        ->name('student.appointments.index');
+
+    // Update details of a single appointment (for fixing typos, etc.).
+    Route::put('appointments/{intake}', [IntakeController::class, 'update'])
+        ->name('student.appointments.update');
 });
