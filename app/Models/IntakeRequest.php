@@ -11,12 +11,34 @@ class IntakeRequest extends Model
 
     protected $fillable = [
         'user_id',
+
+        // Core scheduling + status
         'concern_type',
         'urgency',
         'preferred_date',
         'preferred_time',
         'details',
         'status',
+
+        // Consent & demographic snapshot
+        'consent',
+        'student_name',
+        'age',
+        'gender',
+        'occupation',
+        'living_situation',
+        'living_situation_other',
+
+        // Mental health questionnaire fields
+        'mh_little_interest',
+        'mh_feeling_down',
+        'mh_sleep',
+        'mh_energy',
+        'mh_appetite',
+        'mh_self_esteem',
+        'mh_concentration',
+        'mh_motor',
+        'mh_self_harm',
     ];
 
     /**
