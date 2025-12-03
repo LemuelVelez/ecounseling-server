@@ -50,13 +50,20 @@ Route::prefix('auth')->group(function () {
 |
 | Paths:
 |   POST /student/intake                 -> store a new counseling request
+|   POST /student/intake/assessment      -> store a new assessment record
 |   GET  /student/appointments           -> list counseling requests for the logged-in student
 |   PUT  /student/appointments/{intake}  -> update details for a specific request
 |
 */
 
 Route::middleware('auth')->prefix('student')->group(function () {
-    Route::post('intake', [IntakeController::class, 'store'])->name('student.intake.store');
+    // New route: store Steps 1–3 (assessment) in its own table.
+    Route::post('intake/assessment', [IntakeController::class, 'storeAssessment'])
+        ->name('student.intake.assessment.store');
+
+    // Main counseling request (Step 4 – concern & preferred schedule).
+    Route::post('intake', [IntakeController::class, 'store'])
+        ->name('student.intake.store');
 
     // List all counseling-related appointments/requests for the authenticated student.
     Route::get('appointments', [IntakeController::class, 'appointments'])

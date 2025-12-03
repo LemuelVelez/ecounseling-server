@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\IntakeAssessment;
 use App\Models\IntakeRequest;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -10,6 +11,8 @@ class IntakeController extends Controller
 {
     /**
      * Store a new counseling intake request for the authenticated student.
+     *
+     * This now handles only the main concern & preferred schedule (Step 4).
      *
      * Called from the React page:
      *   POST /student/intake
@@ -31,16 +34,56 @@ class IntakeController extends Controller
             'preferred_date' => ['required', 'date'],
             'preferred_time' => ['required', 'string', 'max:50'],
             'details'        => ['required', 'string'],
+        ]);
 
+        $intake = new IntakeRequest();
+        $intake->user_id        = $user->id;
+
+        // Core fields
+        $intake->concern_type   = $data['concern_type'];
+        $intake->urgency        = $data['urgency'];
+        $intake->preferred_date = $data['preferred_date'];
+        $intake->preferred_time = $data['preferred_time'];
+        $intake->details        = $data['details'];
+        $intake->status         = 'pending';
+
+        $intake->save();
+
+        return response()->json([
+            'message' => 'Your counseling request has been submitted.',
+            'intake'  => $intake,
+        ], 201);
+    }
+
+    /**
+     * Store a new assessment record (Steps 1–3) for the authenticated student.
+     *
+     * This captures consent, demographic snapshot, and general mental health
+     * questionnaire answers in a separate table.
+     *
+     * Called from the React page:
+     *   POST /student/intake/assessment
+     */
+    public function storeAssessment(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $data = $request->validate([
             // Consent (mirrors the checkbox in the React form)
-            'consent'        => ['required', 'boolean'],
+            'consent'                => ['required', 'boolean'],
 
-            // Demographic snapshot (self-reported for this request)
-            'student_name'         => ['nullable', 'string', 'max:255'],
-            'age'                  => ['nullable', 'integer', 'min:10', 'max:120'],
-            'gender'               => ['nullable', 'string', 'max:50'],
-            'occupation'           => ['nullable', 'string', 'max:255'],
-            'living_situation'     => ['nullable', 'string', 'max:50'],
+            // Demographic snapshot (self-reported for this assessment)
+            'student_name'           => ['nullable', 'string', 'max:255'],
+            'age'                    => ['nullable', 'integer', 'min:10', 'max:120'],
+            'gender'                 => ['nullable', 'string', 'max:50'],
+            'occupation'             => ['nullable', 'string', 'max:255'],
+            'living_situation'       => ['nullable', 'string', 'max:50'],
             'living_situation_other' => ['nullable', 'string', 'max:255'],
 
             // Mental health questionnaire (each field uses enum codes)
@@ -55,42 +98,34 @@ class IntakeController extends Controller
             'mh_self_harm'        => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
         ]);
 
-        $intake = new IntakeRequest();
-        $intake->user_id        = $user->id;
-
-        // Core fields
-        $intake->concern_type   = $data['concern_type'];
-        $intake->urgency        = $data['urgency'];
-        $intake->preferred_date = $data['preferred_date'];
-        $intake->preferred_time = $data['preferred_time'];
-        $intake->details        = $data['details'];
-        $intake->status         = 'pending';
+        $assessment = new IntakeAssessment();
+        $assessment->user_id                = $user->id;
 
         // Consent & demographics
-        $intake->consent               = (bool) ($data['consent'] ?? false);
-        $intake->student_name          = $data['student_name'] ?? null;
-        $intake->age                   = $data['age'] ?? null;
-        $intake->gender                = $data['gender'] ?? null;
-        $intake->occupation            = $data['occupation'] ?? null;
-        $intake->living_situation      = $data['living_situation'] ?? null;
-        $intake->living_situation_other = $data['living_situation_other'] ?? null;
+        $assessment->consent                = (bool) ($data['consent'] ?? false);
+        $assessment->student_name           = $data['student_name'] ?? null;
+        $assessment->age                    = $data['age'] ?? null;
+        $assessment->gender                 = $data['gender'] ?? null;
+        $assessment->occupation             = $data['occupation'] ?? null;
+        $assessment->living_situation       = $data['living_situation'] ?? null;
+        $assessment->living_situation_other = $data['living_situation_other'] ?? null;
 
         // MH questionnaire
-        $intake->mh_little_interest = $data['mh_little_interest'] ?? null;
-        $intake->mh_feeling_down    = $data['mh_feeling_down'] ?? null;
-        $intake->mh_sleep           = $data['mh_sleep'] ?? null;
-        $intake->mh_energy          = $data['mh_energy'] ?? null;
-        $intake->mh_appetite        = $data['mh_appetite'] ?? null;
-        $intake->mh_self_esteem     = $data['mh_self_esteem'] ?? null;
-        $intake->mh_concentration   = $data['mh_concentration'] ?? null;
-        $intake->mh_motor           = $data['mh_motor'] ?? null;
-        $intake->mh_self_harm       = $data['mh_self_harm'] ?? null;
+        $assessment->mh_little_interest = $data['mh_little_interest'] ?? null;
+        $assessment->mh_feeling_down    = $data['mh_feeling_down'] ?? null;
+        $assessment->mh_sleep           = $data['mh_sleep'] ?? null;
+        $assessment->mh_energy          = $data['mh_energy'] ?? null;
+        $assessment->mh_appetite        = $data['mh_appetite'] ?? null;
+        $assessment->mh_self_esteem     = $data['mh_self_esteem'] ?? null;
+        $assessment->mh_concentration   = $data['mh_concentration'] ?? null;
+        $assessment->mh_motor           = $data['mh_motor'] ?? null;
+        $assessment->mh_self_harm       = $data['mh_self_harm'] ?? null;
 
-        $intake->save();
+        $assessment->save();
 
         return response()->json([
-            'message' => 'Your counseling request has been submitted.',
-            'intake'  => $intake,
+            'message'    => 'Your assessment has been submitted.',
+            'assessment' => $assessment,
         ], 201);
     }
 
