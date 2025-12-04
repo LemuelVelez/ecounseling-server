@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\IntakeController;
+use App\Http\Controllers\StudentMessageController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -41,19 +42,27 @@ Route::prefix('auth')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Student counseling intake & evaluation routes
+| Student counseling intake, evaluation & messages routes
 |--------------------------------------------------------------------------
 |
 | These endpoints are called from:
 |   src/pages/dashboard/student/intake.tsx
 |   src/pages/dashboard/student/evaluation.tsx
+|   src/api/intake/route.ts
+|   src/pages/dashboard/student/messages.tsx
+|   src/api/messages/route.ts
 |
-| Paths:
+| Paths (intake / evaluation):
 |   POST /student/intake                 -> store a new counseling request
 |   POST /student/intake/assessment      -> store a new assessment record
 |   GET  /student/intake/assessments     -> list assessment records for the logged-in student
 |   GET  /student/appointments           -> list counseling requests for the logged-in student
 |   PUT  /student/appointments/{intake}  -> update details for a specific request
+|
+| Paths (messages):
+|   GET  /student/messages               -> list messages for the logged-in student
+|   POST /student/messages               -> create a new student-authored message
+|   POST /student/messages/mark-as-read  -> mark messages as read (by IDs or all)
 |
 */
 
@@ -77,4 +86,20 @@ Route::middleware('auth')->prefix('student')->group(function () {
     // Update details of a single appointment (for fixing typos, etc.).
     Route::put('appointments/{intake}', [IntakeController::class, 'update'])
         ->name('student.appointments.update');
+
+    // ------------------------------------------------------------------
+    // Student messages (inbox-style messaging with Guidance Office)
+    // ------------------------------------------------------------------
+
+    // List messages for the logged-in student.
+    Route::get('messages', [StudentMessageController::class, 'index'])
+        ->name('student.messages.index');
+
+    // Create a new student-authored message.
+    Route::post('messages', [StudentMessageController::class, 'store'])
+        ->name('student.messages.store');
+
+    // Mark messages as read (by IDs or all).
+    Route::post('messages/mark-as-read', [StudentMessageController::class, 'markAsRead'])
+        ->name('student.messages.markAsRead');
 });
