@@ -130,10 +130,36 @@ class IntakeController extends Controller
     }
 
     /**
+     * List all assessment records (Steps 1–3) for the authenticated student.
+     *
+     * Called from the React Evaluation page:
+     *   GET /student/intake/assessments
+     */
+    public function assessments(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $assessments = IntakeAssessment::query()
+            ->where('user_id', $user->id)
+            ->orderBy('created_at', 'desc')
+            ->get();
+
+        return response()->json([
+            'assessments' => $assessments,
+        ]);
+    }
+
+    /**
      * List all counseling-related intake requests (appointments) for
      * the authenticated student.
      *
-     * Called from the React page:
+     * Called from the React Evaluation page:
      *   GET /student/appointments
      */
     public function appointments(Request $request): JsonResponse
@@ -177,7 +203,7 @@ class IntakeController extends Controller
 
         if ($intake->user_id !== $user->id) {
             return response()->json([
-                'message' => 'You are not allowed to edit this appointment.',
+                'message' => 'You are not allowed to edit this counseling request.',
             ], 403);
         }
 

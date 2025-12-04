@@ -41,16 +41,17 @@ Route::prefix('auth')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| Student counseling intake routes
+| Student counseling intake & evaluation routes
 |--------------------------------------------------------------------------
 |
 | These endpoints are called from:
 |   src/pages/dashboard/student/intake.tsx
-|   src/pages/dashboard/student/appointments.tsx
+|   src/pages/dashboard/student/evaluation.tsx
 |
 | Paths:
 |   POST /student/intake                 -> store a new counseling request
 |   POST /student/intake/assessment      -> store a new assessment record
+|   GET  /student/intake/assessments     -> list assessment records for the logged-in student
 |   GET  /student/appointments           -> list counseling requests for the logged-in student
 |   PUT  /student/appointments/{intake}  -> update details for a specific request
 |
@@ -60,6 +61,10 @@ Route::middleware('auth')->prefix('student')->group(function () {
     // New route: store Steps 1–3 (assessment) in its own table.
     Route::post('intake/assessment', [IntakeController::class, 'storeAssessment'])
         ->name('student.intake.assessment.store');
+
+    // New route: list all assessment records for the authenticated student.
+    Route::get('intake/assessments', [IntakeController::class, 'assessments'])
+        ->name('student.intake.assessments.index');
 
     // Main counseling request (Step 4 – concern & preferred schedule).
     Route::post('intake', [IntakeController::class, 'store'])
