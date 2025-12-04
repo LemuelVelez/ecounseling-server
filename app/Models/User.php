@@ -27,6 +27,7 @@ class User extends Authenticatable
         'year_level',
         'program',
         'course',
+        'avatar_url',
     ];
 
     /**

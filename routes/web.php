@@ -3,6 +3,7 @@
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\IntakeController;
 use App\Http\Controllers\StudentMessageController;
+use App\Http\Controllers\StudentProfileController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -102,4 +103,12 @@ Route::middleware('auth')->prefix('student')->group(function () {
     // Mark messages as read (by IDs or all).
     Route::post('messages/mark-as-read', [StudentMessageController::class, 'markAsRead'])
         ->name('student.messages.markAsRead');
+
+    // ------------------------------------------------------------------
+    // Student profile (avatar, etc.)
+    // ------------------------------------------------------------------
+
+    // Upload / update avatar for the authenticated student.
+    Route::post('profile/avatar', [StudentProfileController::class, 'updateAvatar'])
+        ->name('student.profile.avatar');
 });
