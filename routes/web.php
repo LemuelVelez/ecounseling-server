@@ -25,6 +25,8 @@ Route::get('/', function () {
 |   GET  /auth/me                        -> meApi
 |   POST /auth/email/resend-verification -> resendVerification
 |   GET  /auth/email/verify/{token}      -> verifyEmail
+|   POST /auth/password/forgot           -> forgotPasswordApi
+|   POST /auth/password/reset            -> resetPasswordApi
 |
 */
 
@@ -39,6 +41,13 @@ Route::prefix('auth')->group(function () {
 
     Route::get('email/verify/{token}', [AuthController::class, 'verifyEmail'])
         ->name('auth.email.verify');
+
+    // Password reset (forgot + reset)
+    Route::post('password/forgot', [AuthController::class, 'forgotPassword'])
+        ->name('auth.password.forgot');
+
+    Route::post('password/reset', [AuthController::class, 'resetPassword'])
+        ->name('auth.password.reset');
 });
 
 /*

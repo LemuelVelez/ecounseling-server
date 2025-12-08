@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Mail\ResetPasswordMail;
 use App\Mail\VerifyEmail;
 use App\Models\EmailVerificationToken;
 use App\Models\User;
@@ -9,8 +10,11 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rules\Password;
 
 class AuthController extends Controller
@@ -56,9 +60,9 @@ class AuthController extends Controller
             $verificationEmailSent = true;
         } catch (\Throwable $e) {
             Log::error('[auth] Failed to send verification email', [
-                'user_id'    => $user->id,
-                'email'      => $user->email,
-                'exception'  => $e,
+                'user_id'   => $user->id,
+                'email'     => $user->email,
+                'exception' => $e,
             ]);
         }
 
@@ -66,9 +70,9 @@ class AuthController extends Controller
         $request->session()->regenerate();
 
         return response()->json([
-            'user'                     => $user,
-            'token'                    => null,
-            'verification_email_sent'  => $verificationEmailSent,
+            'user'                    => $user,
+            'token'                   => null,
+            'verification_email_sent' => $verificationEmailSent,
         ], 201);
     }
 
@@ -158,9 +162,9 @@ class AuthController extends Controller
             $this->sendEmailVerification($user);
         } catch (\Throwable $e) {
             Log::error('[auth] Failed to resend verification email', [
-                'user_id'    => $user->id,
-                'email'      => $user->email,
-                'exception'  => $e,
+                'user_id'   => $user->id,
+                'email'     => $user->email,
+                'exception' => $e,
             ]);
 
             return response()->json([
@@ -223,6 +227,125 @@ class AuthController extends Controller
             . '&message=' . urlencode($message);
 
         return redirect()->away($redirectUrl);
+    }
+
+    /**
+     * Request a password reset link.
+     *
+     * Endpoint: POST /auth/password/forgot
+     */
+    public function forgotPassword(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'email' => ['required', 'email'],
+        ]);
+
+        $genericMessage = 'If an account exists for this email, we have sent a password reset link.';
+
+        $user = User::where('email', $data['email'])->first();
+
+        // Do not loudly reveal whether the user exists or not.
+        if (! $user) {
+            return response()->json([
+                'message' => $genericMessage,
+            ]);
+        }
+
+        try {
+            // Generate a random token and store a hashed version in password_reset_tokens
+            $plainToken = Str::random(64);
+
+            DB::table('password_reset_tokens')->updateOrInsert(
+                ['email' => $user->email],
+                [
+                    'token'      => Hash::make($plainToken),
+                    'created_at' => Carbon::now(),
+                ],
+            );
+
+            $frontendBase = rtrim(env('FRONTEND_URL', config('app.url')), '/');
+            $resetUrl     = $frontendBase . '/auth/reset-password'
+                . '?token=' . urlencode($plainToken)
+                . '&email=' . urlencode($user->email);
+
+            // Use your custom Mailable + Blade template
+            Mail::to($user->email)->send(new ResetPasswordMail($user, $resetUrl));
+        } catch (\Throwable $e) {
+            Log::error('[auth] Failed to send password reset email', [
+                'user_id'   => $user->id,
+                'email'     => $user->email,
+                'exception' => $e,
+            ]);
+
+            return response()->json([
+                'message' => 'We couldn\'t send a reset link right now. Please try again.',
+            ], 500);
+        }
+
+        return response()->json([
+            'message' => $genericMessage,
+        ]);
+    }
+
+    /**
+     * Reset the password using a token from the email link.
+     *
+     * Endpoint: POST /auth/password/reset
+     */
+    public function resetPassword(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'token'    => ['required', 'string'],
+            'email'    => ['required', 'email'],
+            'password' => ['required', 'string', Password::min(8), 'confirmed'],
+        ]);
+
+        $record = DB::table('password_reset_tokens')
+            ->where('email', $data['email'])
+            ->first();
+
+        if (! $record) {
+            return response()->json([
+                'message' => 'This password reset link is invalid or has expired.',
+            ], 422);
+        }
+
+        // Optional: expire after 2 hours
+        if (isset($record->created_at)
+            && Carbon::parse($record->created_at)->addHours(2)->isPast()
+        ) {
+            DB::table('password_reset_tokens')->where('email', $data['email'])->delete();
+
+            return response()->json([
+                'message' => 'This password reset link is invalid or has expired.',
+            ], 422);
+        }
+
+        // Compare the plain token from the URL with the hashed token in DB
+        if (! Hash::check($data['token'], $record->token)) {
+            return response()->json([
+                'message' => 'This password reset link is invalid or has expired.',
+            ], 422);
+        }
+
+        $user = User::where('email', $data['email'])->first();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'We could not find an account for this email address.',
+            ], 404);
+        }
+
+        // The "password" cast on the User model will hash this automatically
+        $user->password = $data['password'];
+        $user->save();
+
+        // Invalidate the token so it can't be reused
+        DB::table('password_reset_tokens')->where('email', $data['email'])->delete();
+
+        return response()->json([
+            'message' => 'Your password has been reset successfully. You can now sign in with your new password.',
+        ]);
     }
 
     /**
