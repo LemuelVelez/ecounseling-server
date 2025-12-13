@@ -9,12 +9,6 @@ use Illuminate\Http\Request;
 
 class IntakeController extends Controller
 {
-    /**
-     * Store a new counseling intake request for the authenticated student.
-     *
-     * Called from React:
-     *   POST /student/intake
-     */
     public function store(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -37,8 +31,15 @@ class IntakeController extends Controller
         $intake->user_id        = $user->id;
         $intake->concern_type   = $data['concern_type'];
         $intake->urgency        = $data['urgency'];
+
+        // Student preference
         $intake->preferred_date = $data['preferred_date'];
         $intake->preferred_time = $data['preferred_time'];
+
+        // Counselor final schedule starts empty ✅
+        $intake->scheduled_date = null;
+        $intake->scheduled_time = null;
+
         $intake->details        = $data['details'];
         $intake->status         = 'pending';
         $intake->save();
@@ -49,12 +50,6 @@ class IntakeController extends Controller
         ], 201);
     }
 
-    /**
-     * Store a new assessment record (Steps 1–3) for the authenticated student.
-     *
-     * Called from React:
-     *   POST /student/intake/assessment
-     */
     public function storeAssessment(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -115,12 +110,6 @@ class IntakeController extends Controller
         ], 201);
     }
 
-    /**
-     * List all assessment records (Steps 1–3) for the authenticated student.
-     *
-     * Called from React:
-     *   GET /student/intake/assessments
-     */
     public function assessments(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -141,12 +130,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * List all counseling-related intake requests (appointments) for the authenticated student.
-     *
-     * Called from React:
-     *   GET /student/appointments
-     */
     public function appointments(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -168,12 +151,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * Update the details of a counseling appointment for the authenticated student.
-     *
-     * Called from React:
-     *   PUT /student/appointments/{intake}
-     */
     public function update(Request $request, IntakeRequest $intake): JsonResponse
     {
         $user = $request->user();
@@ -190,9 +167,10 @@ class IntakeController extends Controller
             ], 403);
         }
 
-        if (in_array($intake->status, ['scheduled', 'closed'], true)) {
+        $lockedStatuses = ['scheduled', 'completed', 'cancelled', 'canceled', 'closed'];
+        if (in_array((string) $intake->status, $lockedStatuses, true)) {
             return response()->json([
-                'message' => 'You can no longer edit this request because it has already been scheduled or closed.',
+                'message' => 'You can no longer edit this request because it has already been handled.',
             ], 422);
         }
 
@@ -209,12 +187,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * Counselor view: list ALL counseling requests (Step 4) across students.
-     *
-     * Called from React:
-     *   GET /counselor/intake/requests
-     */
     public function counselorRequests(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -225,7 +197,6 @@ class IntakeController extends Controller
             ], 401);
         }
 
-        // Include the submitting student user record to show names in React
         $requests = IntakeRequest::query()
             ->with(['user' => function ($q) {
                 $q->select('id', 'name', 'email');
@@ -238,12 +209,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * Counselor view: list ALL assessment submissions (Steps 1–3) across students.
-     *
-     * Called from React:
-     *   GET /counselor/intake/assessments
-     */
     public function counselorAssessments(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -263,6 +228,78 @@ class IntakeController extends Controller
 
         return response()->json([
             'assessments' => $assessments,
+        ]);
+    }
+
+    /**
+     * Counselor update: schedule and/or status for a counseling appointment.
+     *
+     * PATCH /counselor/appointments/{intake}
+     * PATCH /counselor/intake/requests/{intake}
+     *
+     * ✅ Now writes counselor schedule into scheduled_date/scheduled_time
+     * ✅ Does NOT overwrite preferred_date/preferred_time anymore
+     */
+    public function counselorUpdateAppointment(Request $request, IntakeRequest $intake): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $role = strtolower((string) ($user->role ?? ''));
+        if (! str_contains($role, 'counselor') && ! str_contains($role, 'counsellor')) {
+            return response()->json([
+                'message' => 'Forbidden.',
+            ], 403);
+        }
+
+        $data = $request->validate([
+            'status' => ['nullable', 'string', 'in:pending,scheduled,completed,cancelled,canceled,closed'],
+
+            // accept either scheduled_* or preferred_* from older frontend,
+            // but always store into scheduled_*.
+            'scheduled_date' => ['nullable', 'date'],
+            'scheduled_time' => ['nullable', 'string', 'max:50'],
+            'preferred_date' => ['nullable', 'date'],
+            'preferred_time' => ['nullable', 'string', 'max:50'],
+        ]);
+
+        $incomingDate = $data['scheduled_date'] ?? $data['preferred_date'] ?? null;
+        $incomingTime = $data['scheduled_time'] ?? $data['preferred_time'] ?? null;
+
+        if (($incomingDate && ! $incomingTime) || (! $incomingDate && $incomingTime)) {
+            return response()->json([
+                'message' => 'Please provide both date and time when setting an appointment schedule.',
+            ], 422);
+        }
+
+        if ($incomingDate && $incomingTime) {
+            $intake->scheduled_date = $incomingDate;
+            $intake->scheduled_time = $incomingTime;
+
+            // default to scheduled if they didn’t explicitly send a status
+            if (empty($data['status'])) {
+                $intake->status = 'scheduled';
+            }
+        }
+
+        if (! empty($data['status'])) {
+            $status = strtolower((string) $data['status']);
+            if ($status === 'canceled') {
+                $status = 'cancelled';
+            }
+            $intake->status = $status;
+        }
+
+        $intake->save();
+
+        return response()->json([
+            'message'     => 'Appointment updated.',
+            'appointment' => $intake,
         ]);
     }
 }

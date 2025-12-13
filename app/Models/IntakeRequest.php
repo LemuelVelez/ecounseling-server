@@ -15,8 +15,15 @@ class IntakeRequest extends Model
         // Core scheduling + status
         'concern_type',
         'urgency',
+
+        // Student preference
         'preferred_date',
         'preferred_time',
+
+        // Counselor final schedule ✅
+        'scheduled_date',
+        'scheduled_time',
+
         'details',
         'status',
 

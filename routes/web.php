@@ -77,8 +77,10 @@ Route::middleware('auth')->prefix('student')->group(function () {
 | Counselor intake review routes (React counselor dashboard)
 |--------------------------------------------------------------------------
 | React calls:
-|   GET /counselor/intake/requests
-|   GET /counselor/intake/assessments
+|   GET   /counselor/intake/requests
+|   GET   /counselor/intake/assessments
+|   PATCH /counselor/appointments/{intake}          ✅ added (schedule/status updates)
+|   PATCH /counselor/intake/requests/{intake}       ✅ added (compat/fallback)
 */
 
 Route::middleware('auth')->prefix('counselor')->group(function () {
@@ -87,6 +89,14 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
     Route::get('intake/assessments', [IntakeController::class, 'counselorAssessments'])
         ->name('counselor.intake.assessments.index');
+
+    // ✅ Counselor updates: schedule + status
+    Route::patch('appointments/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
+        ->name('counselor.appointments.update');
+
+    // ✅ Backwards/compat route used by frontend fallback
+    Route::patch('intake/requests/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
+        ->name('counselor.intake.requests.update');
 });
 
 /*
