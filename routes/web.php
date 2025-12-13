@@ -74,6 +74,23 @@ Route::middleware('auth')->prefix('student')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
+| Counselor intake review routes (React counselor dashboard)
+|--------------------------------------------------------------------------
+| React calls:
+|   GET /counselor/intake/requests
+|   GET /counselor/intake/assessments
+*/
+
+Route::middleware('auth')->prefix('counselor')->group(function () {
+    Route::get('intake/requests', [IntakeController::class, 'counselorRequests'])
+        ->name('counselor.intake.requests.index');
+
+    Route::get('intake/assessments', [IntakeController::class, 'counselorAssessments'])
+        ->name('counselor.intake.assessments.index');
+});
+
+/*
+|--------------------------------------------------------------------------
 | Admin routes (for the React admin dashboard)
 |--------------------------------------------------------------------------
 | React calls:

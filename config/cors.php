@@ -16,8 +16,9 @@ return [
     // Enable CORS on the routes your SPA actually calls.
     'paths' => [
         'auth/*',              // /auth/login, /auth/register, /auth/logout, /auth/me
-        'student/*',           // ✅ /student/intake and other student endpoints
-        'admin/*',             // ✅ /admin/users, /admin/roles, etc.
+        'student/*',           // /student/intake and other student endpoints
+        'counselor/*',         // ✅ counselor endpoints
+        'admin/*',             // /admin/users, /admin/roles, etc.
         'sanctum/csrf-cookie', // if you later use Sanctum
     ],
 

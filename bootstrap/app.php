@@ -16,9 +16,10 @@ return Application::configure(basePath: dirname(__DIR__))
          *
          * We keep CSRF enabled for normal web routes, but we skip CSRF
          * validation for the JSON endpoints your SPA calls directly:
-         *   - /auth/*     (login, register, logout, me, etc.)
-         *   - /student/*  (e.g. /student/intake)
-         *   - /admin/*    (e.g. /admin/users, /admin/roles)
+         *   - /auth/*      (login, register, logout, me, etc.)
+         *   - /student/*   (student endpoints)
+         *   - /counselor/* (✅ counselor endpoints)
+         *   - /admin/*     (admin endpoints)
          *
          * These routes are still protected by:
          *   - The session cookie (sent with credentials: "include")
@@ -27,9 +28,10 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->validateCsrfTokens(
             except: [
-                'auth/*',    // /auth/login, /auth/register, /auth/logout, /auth/me, etc.
-                'student/*', // ✅ /student/intake and other student endpoints from the SPA
-                'admin/*',   // ✅ /admin/users, /admin/roles, etc.
+                'auth/*',
+                'student/*',
+                'counselor/*',
+                'admin/*',
             ],
         );
     })
