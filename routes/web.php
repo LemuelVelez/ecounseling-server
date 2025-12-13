@@ -77,10 +77,16 @@ Route::middleware('auth')->prefix('student')->group(function () {
 | Counselor intake review routes (React counselor dashboard)
 |--------------------------------------------------------------------------
 | React calls:
-|   GET   /counselor/intake/requests
-|   GET   /counselor/intake/assessments
-|   PATCH /counselor/appointments/{intake}          ✅ added (schedule/status updates)
-|   PATCH /counselor/intake/requests/{intake}       ✅ added (compat/fallback)
+|   GET    /counselor/intake/requests
+|   GET    /counselor/intake/assessments
+|   PATCH  /counselor/appointments/{intake}          ✅ schedule/status updates
+|   PATCH  /counselor/intake/requests/{intake}       ✅ compat/fallback
+|   DELETE /counselor/appointments/{intake}          ✅ delete
+|   DELETE /counselor/intake/requests/{intake}       ✅ delete compat/fallback
+|
+| ✅ FIX: also allow PUT to avoid 405 if client/server mismatch.
+| ✅ FIX: add DELETE routes to avoid 405 on delete.
+|--------------------------------------------------------------------------
 */
 
 Route::middleware('auth')->prefix('counselor')->group(function () {
@@ -90,13 +96,21 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
     Route::get('intake/assessments', [IntakeController::class, 'counselorAssessments'])
         ->name('counselor.intake.assessments.index');
 
-    // ✅ Counselor updates: schedule + status
-    Route::patch('appointments/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
+    // ✅ Counselor updates: schedule + status (PATCH/PUT)
+    Route::match(['PATCH', 'PUT'], 'appointments/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
         ->name('counselor.appointments.update');
 
-    // ✅ Backwards/compat route used by frontend fallback
-    Route::patch('intake/requests/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
+    // ✅ Backwards/compat route used by frontend fallback (PATCH/PUT)
+    Route::match(['PATCH', 'PUT'], 'intake/requests/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
         ->name('counselor.intake.requests.update');
+
+    // ✅ DELETE (fixes 405 when frontend sends DELETE)
+    Route::delete('appointments/{intake}', [IntakeController::class, 'counselorDeleteAppointment'])
+        ->name('counselor.appointments.delete');
+
+    // ✅ DELETE fallback/compat
+    Route::delete('intake/requests/{intake}', [IntakeController::class, 'counselorDeleteAppointment'])
+        ->name('counselor.intake.requests.delete');
 });
 
 /*

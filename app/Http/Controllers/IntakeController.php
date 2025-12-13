@@ -302,4 +302,36 @@ class IntakeController extends Controller
             'appointment' => $intake,
         ]);
     }
+
+    /**
+     * Counselor delete: remove a counseling appointment/request.
+     *
+     * DELETE /counselor/appointments/{intake}
+     * DELETE /counselor/intake/requests/{intake}
+     *
+     * ✅ FIX: prevents 405 Method Not Allowed when frontend sends DELETE.
+     */
+    public function counselorDeleteAppointment(Request $request, IntakeRequest $intake): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $role = strtolower((string) ($user->role ?? ''));
+        if (! str_contains($role, 'counselor') && ! str_contains($role, 'counsellor')) {
+            return response()->json([
+                'message' => 'Forbidden.',
+            ], 403);
+        }
+
+        $intake->delete();
+
+        return response()->json([
+            'message' => 'Appointment/request deleted.',
+        ]);
+    }
 }
