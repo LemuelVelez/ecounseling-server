@@ -151,6 +151,141 @@ class IntakeController extends Controller
         ]);
     }
 
+    /**
+     * ✅ FIX: /student/assessments/{id} (prevents 404 when frontend hits this URL)
+     * ✅ NEW: supports DELETE /student/assessments/{id} and DELETE /student/intake/assessments/{id}
+     */
+    public function studentAssessment(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $method = strtoupper($request->method());
+
+        // ✅ DELETE: student deletes their own assessment
+        if ($method === 'DELETE') {
+            $assessment = IntakeAssessment::query()->find($id);
+
+            if (! $assessment) {
+                return response()->json([
+                    'message' => 'Assessment not found.',
+                ], 404);
+            }
+
+            if ((string) $assessment->user_id !== (string) $user->id) {
+                return response()->json([
+                    'message' => 'Forbidden.',
+                ], 403);
+            }
+
+            $assessment->delete();
+
+            return response()->json([
+                'message' => 'Assessment deleted.',
+            ]);
+        }
+
+        // GET: Try primary key first
+        $assessment = IntakeAssessment::query()->find($id);
+
+        // Fallback: if client passed the user's id, return latest assessment for that student
+        if (! $assessment && (string) $id === (string) $user->id) {
+            $assessment = IntakeAssessment::query()
+                ->where('user_id', $user->id)
+                ->orderBy('created_at', 'desc')
+                ->first();
+        }
+
+        if (! $assessment) {
+            return response()->json([
+                'message' => 'Assessment not found.',
+            ], 404);
+        }
+
+        if ((string) $assessment->user_id !== (string) $user->id) {
+            return response()->json([
+                'message' => 'Forbidden.',
+            ], 403);
+        }
+
+        return response()->json([
+            'assessment' => $assessment,
+        ]);
+    }
+
+    /**
+     * ✅ FIX: /student/appointments/{id} GET (prevents 405 when frontend tries to load a single item)
+     * ✅ NEW: supports DELETE /student/appointments/{id} (used by student Evaluation page delete button)
+     */
+    public function studentAppointment(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $method = strtoupper($request->method());
+
+        // ✅ DELETE: student deletes their own appointment/request
+        if ($method === 'DELETE') {
+            $appointment = IntakeRequest::query()->find($id);
+
+            if (! $appointment) {
+                return response()->json([
+                    'message' => 'Appointment not found.',
+                ], 404);
+            }
+
+            if ((string) $appointment->user_id !== (string) $user->id) {
+                return response()->json([
+                    'message' => 'Forbidden.',
+                ], 403);
+            }
+
+            $appointment->delete();
+
+            return response()->json([
+                'message' => 'Appointment/request deleted.',
+            ]);
+        }
+
+        // GET: normal lookup
+        $appointment = IntakeRequest::query()->find($id);
+
+        // Optional fallback: if client passed user's id, return latest appointment for that student
+        if (! $appointment && (string) $id === (string) $user->id) {
+            $appointment = IntakeRequest::query()
+                ->where('user_id', $user->id)
+                ->orderBy('created_at', 'desc')
+                ->first();
+        }
+
+        if (! $appointment) {
+            return response()->json([
+                'message' => 'Appointment not found.',
+            ], 404);
+        }
+
+        if ((string) $appointment->user_id !== (string) $user->id) {
+            return response()->json([
+                'message' => 'Forbidden.',
+            ], 403);
+        }
+
+        return response()->json([
+            // keep key name consistent with other student update responses
+            'appointment' => $appointment,
+        ]);
+    }
+
     public function update(Request $request, IntakeRequest $intake): JsonResponse
     {
         $user = $request->user();
@@ -231,20 +366,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * Counselor assessment endpoint that tolerates "id" being either:
-     * - IntakeAssessment primary key, OR
-     * - user_id (fallback: return latest assessment for that user)
-     *
-     * Supports:
-     *   GET    -> return assessment
-     *   PATCH/PUT -> optional update (safe: only updates provided fields)
-     *   DELETE -> delete assessment (if found)
-     *
-     * This fixes:
-     * - 404 from route-model binding when the client sends a user_id/intake id
-     * - 405 when the client sends PUT/PATCH to this URL
-     */
     public function counselorAssessment(Request $request, $id): JsonResponse
     {
         $user = $request->user();
@@ -288,7 +409,6 @@ class IntakeController extends Controller
             ]);
         }
 
-        // Allow PUT/PATCH so client doesn't get 405.
         if ($method === 'PUT' || $method === 'PATCH') {
             $data = $request->validate([
                 'consent'                => ['nullable', 'boolean'],

@@ -41,6 +41,11 @@ Route::prefix('auth')->group(function () {
 |--------------------------------------------------------------------------
 | Student counseling intake, evaluation & messages routes
 |--------------------------------------------------------------------------
+| ✅ FIXES:
+| - 404 on  /student/assessments/{id}  (add aliases)
+| - 405 on  /student/appointments/{id} (add GET route)
+| - ✅ NEW: 405 on DELETE for student delete actions
+|--------------------------------------------------------------------------
 */
 
 Route::middleware('auth')->prefix('student')->group(function () {
@@ -50,13 +55,42 @@ Route::middleware('auth')->prefix('student')->group(function () {
     Route::get('intake/assessments', [IntakeController::class, 'assessments'])
         ->name('student.intake.assessments.index');
 
+    // ✅ NEW: allow GET/DELETE for a single assessment via /student/intake/assessments/{id}
+    Route::match(['GET', 'DELETE'], 'intake/assessments/{id}', [IntakeController::class, 'studentAssessment'])
+        ->name('student.intake.assessments.show');
+
+    // ✅ Alias: some clients call /student/assessments
+    Route::get('assessments', [IntakeController::class, 'assessments'])
+        ->name('student.assessments.index');
+
+    // ✅ UPDATED: allow GET + DELETE /student/assessments/{id}
+    Route::match(['GET', 'DELETE'], 'assessments/{id}', [IntakeController::class, 'studentAssessment'])
+        ->name('student.assessments.show');
+
     Route::post('intake', [IntakeController::class, 'store'])
         ->name('student.intake.store');
 
     Route::get('appointments', [IntakeController::class, 'appointments'])
         ->name('student.appointments.index');
 
-    Route::put('appointments/{intake}', [IntakeController::class, 'update'])
+    // ✅ UPDATED: allow GET + DELETE /student/appointments/{id}
+    Route::match(['GET', 'DELETE'], 'appointments/{id}', [IntakeController::class, 'studentAppointment'])
+        ->name('student.appointments.show');
+
+    // ✅ Alias used by frontend fallback candidates (DELETE/GET)
+    Route::match(['GET', 'DELETE'], 'intake/requests/{id}', [IntakeController::class, 'studentAppointment'])
+        ->name('student.intake.requests.show');
+
+    // ✅ Extra alias used by frontend fallback candidates (DELETE/GET)
+    Route::match(['GET', 'DELETE'], 'counseling/requests/{id}', [IntakeController::class, 'studentAppointment'])
+        ->name('student.counseling.requests.show');
+
+    // ✅ Extra alias used by frontend fallback candidates (DELETE/GET)
+    Route::match(['GET', 'DELETE'], 'evaluations/{id}', [IntakeController::class, 'studentAppointment'])
+        ->name('student.evaluations.show');
+
+    // ✅ FIX: allow PATCH too (prevents 405 if frontend uses PATCH)
+    Route::match(['PUT', 'PATCH'], 'appointments/{intake}', [IntakeController::class, 'update'])
         ->name('student.appointments.update');
 
     Route::get('messages', [StudentMessageController::class, 'index'])
@@ -75,16 +109,6 @@ Route::middleware('auth')->prefix('student')->group(function () {
 /*
 |--------------------------------------------------------------------------
 | Counselor intake review routes (React counselor dashboard)
-|--------------------------------------------------------------------------
-| ✅ FIX for your errors:
-| - Some clients call /counselor/intake/assessments/{id} where {id} is NOT
-|   the IntakeAssessment primary key (often it's a user_id or intake id).
-| - Route model-binding would 404 before controller runs.
-| - Some clients also call PUT/PATCH on that URL (causing 405).
-|
-| Solution:
-| - Accept {id} as a plain value (no model-binding).
-| - Support GET/PATCH/PUT/DELETE on those "show" URLs.
 |--------------------------------------------------------------------------
 */
 
@@ -113,7 +137,7 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
     Route::match(['PATCH', 'PUT'], 'intake/requests/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
         ->name('counselor.intake.requests.update');
 
-    // ✅ DELETE (fixes 405 when frontend sends DELETE)
+    // ✅ DELETE
     Route::delete('appointments/{intake}', [IntakeController::class, 'counselorDeleteAppointment'])
         ->name('counselor.appointments.delete');
 
