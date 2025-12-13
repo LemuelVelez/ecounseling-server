@@ -76,16 +76,15 @@ Route::middleware('auth')->prefix('student')->group(function () {
 |--------------------------------------------------------------------------
 | Counselor intake review routes (React counselor dashboard)
 |--------------------------------------------------------------------------
-| React calls:
-|   GET    /counselor/intake/requests
-|   GET    /counselor/intake/assessments
-|   PATCH  /counselor/appointments/{intake}          ✅ schedule/status updates
-|   PATCH  /counselor/intake/requests/{intake}       ✅ compat/fallback
-|   DELETE /counselor/appointments/{intake}          ✅ delete
-|   DELETE /counselor/intake/requests/{intake}       ✅ delete compat/fallback
+| ✅ FIX for your errors:
+| - Some clients call /counselor/intake/assessments/{id} where {id} is NOT
+|   the IntakeAssessment primary key (often it's a user_id or intake id).
+| - Route model-binding would 404 before controller runs.
+| - Some clients also call PUT/PATCH on that URL (causing 405).
 |
-| ✅ FIX: also allow PUT to avoid 405 if client/server mismatch.
-| ✅ FIX: add DELETE routes to avoid 405 on delete.
+| Solution:
+| - Accept {id} as a plain value (no model-binding).
+| - Support GET/PATCH/PUT/DELETE on those "show" URLs.
 |--------------------------------------------------------------------------
 */
 
@@ -95,6 +94,16 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
     Route::get('intake/assessments', [IntakeController::class, 'counselorAssessments'])
         ->name('counselor.intake.assessments.index');
+
+    // ✅ Counselor assessment "show" + compat aliases (no model-binding; supports GET/PATCH/PUT/DELETE)
+    Route::match(['GET', 'PATCH', 'PUT', 'DELETE'], 'intake/assessments/{id}', [IntakeController::class, 'counselorAssessment'])
+        ->name('counselor.intake.assessments.show');
+
+    Route::match(['GET', 'PATCH', 'PUT', 'DELETE'], 'assessments/{id}', [IntakeController::class, 'counselorAssessment'])
+        ->name('counselor.assessments.show');
+
+    Route::match(['GET', 'PATCH', 'PUT', 'DELETE'], 'intake/assessment/{id}', [IntakeController::class, 'counselorAssessment'])
+        ->name('counselor.intake.assessment.show');
 
     // ✅ Counselor updates: schedule + status (PATCH/PUT)
     Route::match(['PATCH', 'PUT'], 'appointments/{intake}', [IntakeController::class, 'counselorUpdateAppointment'])
@@ -117,11 +126,6 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 |--------------------------------------------------------------------------
 | Admin routes (for the React admin dashboard)
 |--------------------------------------------------------------------------
-| React calls:
-|   GET   /admin/roles
-|   GET   /admin/users
-|   POST  /admin/users
-|   PATCH /admin/users/{user}/role
 */
 
 Route::middleware('auth')->prefix('admin')->group(function () {

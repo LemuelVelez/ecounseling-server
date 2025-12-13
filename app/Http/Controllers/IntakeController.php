@@ -232,14 +232,100 @@ class IntakeController extends Controller
     }
 
     /**
-     * Counselor update: schedule and/or status for a counseling appointment.
+     * Counselor assessment endpoint that tolerates "id" being either:
+     * - IntakeAssessment primary key, OR
+     * - user_id (fallback: return latest assessment for that user)
      *
-     * PATCH /counselor/appointments/{intake}
-     * PATCH /counselor/intake/requests/{intake}
+     * Supports:
+     *   GET    -> return assessment
+     *   PATCH/PUT -> optional update (safe: only updates provided fields)
+     *   DELETE -> delete assessment (if found)
      *
-     * ✅ Now writes counselor schedule into scheduled_date/scheduled_time
-     * ✅ Does NOT overwrite preferred_date/preferred_time anymore
+     * This fixes:
+     * - 404 from route-model binding when the client sends a user_id/intake id
+     * - 405 when the client sends PUT/PATCH to this URL
      */
+    public function counselorAssessment(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return response()->json([
+                'message' => 'Unauthenticated.',
+            ], 401);
+        }
+
+        $role = strtolower((string) ($user->role ?? ''));
+        if (! str_contains($role, 'counselor') && ! str_contains($role, 'counsellor')) {
+            return response()->json([
+                'message' => 'Forbidden.',
+            ], 403);
+        }
+
+        $assessment = IntakeAssessment::query()->find($id);
+
+        // Fallback: treat {id} as user_id and return latest assessment for that user.
+        if (! $assessment) {
+            $assessment = IntakeAssessment::query()
+                ->where('user_id', $id)
+                ->orderBy('created_at', 'desc')
+                ->first();
+        }
+
+        if (! $assessment) {
+            return response()->json([
+                'message' => 'Assessment not found.',
+            ], 404);
+        }
+
+        $method = strtoupper($request->method());
+
+        if ($method === 'DELETE') {
+            $assessment->delete();
+
+            return response()->json([
+                'message' => 'Assessment deleted.',
+            ]);
+        }
+
+        // Allow PUT/PATCH so client doesn't get 405.
+        if ($method === 'PUT' || $method === 'PATCH') {
+            $data = $request->validate([
+                'consent'                => ['nullable', 'boolean'],
+
+                'student_name'           => ['nullable', 'string', 'max:255'],
+                'age'                    => ['nullable', 'integer', 'min:10', 'max:120'],
+                'gender'                 => ['nullable', 'string', 'max:50'],
+                'occupation'             => ['nullable', 'string', 'max:255'],
+                'living_situation'       => ['nullable', 'string', 'max:50'],
+                'living_situation_other' => ['nullable', 'string', 'max:255'],
+
+                'mh_little_interest'  => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_feeling_down'     => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_sleep'            => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_energy'           => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_appetite'         => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_self_esteem'      => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_concentration'    => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_motor'            => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+                'mh_self_harm'        => ['nullable', 'string', 'in:not_at_all,several_days,more_than_half,nearly_every_day'],
+            ]);
+
+            if (! empty($data)) {
+                $assessment->fill($data);
+                $assessment->save();
+            }
+        }
+
+        $assessment->load(['user' => function ($q) {
+            $q->select('id', 'name', 'email');
+        }]);
+
+        return response()->json([
+            'assessment' => $assessment,
+        ]);
+    }
+
     public function counselorUpdateAppointment(Request $request, IntakeRequest $intake): JsonResponse
     {
         $user = $request->user();
@@ -260,8 +346,6 @@ class IntakeController extends Controller
         $data = $request->validate([
             'status' => ['nullable', 'string', 'in:pending,scheduled,completed,cancelled,canceled,closed'],
 
-            // accept either scheduled_* or preferred_* from older frontend,
-            // but always store into scheduled_*.
             'scheduled_date' => ['nullable', 'date'],
             'scheduled_time' => ['nullable', 'string', 'max:50'],
             'preferred_date' => ['nullable', 'date'],
@@ -281,7 +365,6 @@ class IntakeController extends Controller
             $intake->scheduled_date = $incomingDate;
             $intake->scheduled_time = $incomingTime;
 
-            // default to scheduled if they didn’t explicitly send a status
             if (empty($data['status'])) {
                 $intake->status = 'scheduled';
             }
@@ -303,14 +386,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * Counselor delete: remove a counseling appointment/request.
-     *
-     * DELETE /counselor/appointments/{intake}
-     * DELETE /counselor/intake/requests/{intake}
-     *
-     * ✅ FIX: prevents 405 Method Not Allowed when frontend sends DELETE.
-     */
     public function counselorDeleteAppointment(Request $request, IntakeRequest $intake): JsonResponse
     {
         $user = $request->user();
