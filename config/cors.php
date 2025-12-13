@@ -17,6 +17,7 @@ return [
     'paths' => [
         'auth/*',              // /auth/login, /auth/register, /auth/logout, /auth/me
         'student/*',           // ✅ /student/intake and other student endpoints
+        'admin/*',             // ✅ /admin/users, /admin/roles, etc.
         'sanctum/csrf-cookie', // if you later use Sanctum
     ],
 
