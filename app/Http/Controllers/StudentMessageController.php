@@ -11,14 +11,10 @@ class StudentMessageController extends Controller
     /**
      * GET /student/messages
      *
-     * Fetch all messages for the authenticated student.
+     * Fetch all messages for the authenticated student/guest.
      *
-     * Returns a JSON shape matching:
-     *   GetStudentMessagesResponseDto (src/api/messages/route.ts)
-     *   {
-     *     "message"?: string,
-     *     "messages": MessageDto[]
-     *   }
+     * IMPORTANT:
+     * Student UI expects "is_read" to be the student read flag.
      */
     public function index(Request $request): JsonResponse
     {
@@ -45,16 +41,11 @@ class StudentMessageController extends Controller
     /**
      * POST /student/messages
      *
-     * Create a new message authored by the current student.
+     * Create a new message authored by the current student OR guest.
      *
-     * Request body (CreateStudentMessagePayload):
-     *   { "content": string }
-     *
-     * Response (CreateStudentMessageResponseDto):
-     *   {
-     *     "message"?: string,
-     *     "messageRecord": MessageDto
-     *   }
+     * This is always routed to the counselor office:
+     *   recipient_role = counselor
+     *   recipient_id   = null (office inbox)
      */
     public function store(Request $request): JsonResponse
     {
@@ -70,13 +61,31 @@ class StudentMessageController extends Controller
             'content' => ['required', 'string'],
         ]);
 
+        $role = strtolower((string) ($user->role ?? 'student'));
+        $senderRole = str_contains($role, 'guest') ? 'guest' : 'student';
+
         $message = new Message();
         $message->user_id     = $user->id;
-        $message->sender      = 'student';
+
+        $message->sender      = $senderRole;
+        $message->sender_id   = (int) $user->id;
         $message->sender_name = $user->name ?? null;
-        $message->content     = $data['content'];
-        // From the student's perspective, their own message is already "read"
-        $message->is_read     = true;
+
+        $message->recipient_role = 'counselor';
+        $message->recipient_id   = null;
+
+        // Stable thread id per student/guest
+        $message->conversation_id = "student-{$user->id}";
+
+        $message->content = $data['content'];
+
+        // Student has already "read" their own outgoing message
+        $message->is_read = true;
+        $message->student_read_at = now();
+
+        // Counselor has not read it yet
+        $message->counselor_is_read = false;
+        $message->counselor_read_at = null;
 
         $message->save();
 
@@ -89,21 +98,10 @@ class StudentMessageController extends Controller
     /**
      * POST /student/messages/mark-as-read
      *
-     * Mark one or more messages as read for the current student.
+     * Marks messages as read for the student/guest.
+     * Only affects messages belonging to current user.
      *
-     * Request body (MarkMessagesReadPayload):
-     *   {
-     *     "message_ids"?: number[]
-     *   }
-     *
-     * - If message_ids is omitted or an empty array, ALL messages for the student are marked read.
-     * - Only messages belonging to the current student are affected.
-     *
-     * Response (MarkMessagesReadResponseDto):
-     *   {
-     *     "message"?: string,
-     *     "updated_count"?: number
-     *   }
+     * - If message_ids omitted/empty => mark all as read.
      */
     public function markAsRead(Request $request): JsonResponse
     {
@@ -124,6 +122,10 @@ class StudentMessageController extends Controller
             ->where('user_id', $user->id)
             ->where('is_read', false);
 
+        // Typically only counselor/system messages are unread for student
+        // (Student outgoing messages are stored as is_read=true.)
+        $query->whereIn('sender', ['counselor', 'system']);
+
         $messageIds = $data['message_ids'] ?? null;
 
         if (is_array($messageIds) && count($messageIds) > 0) {
@@ -132,6 +134,7 @@ class StudentMessageController extends Controller
 
         $updatedCount = $query->update([
             'is_read' => true,
+            'student_read_at' => now(),
         ]);
 
         return response()->json([
