@@ -7,151 +7,214 @@ use Illuminate\Support\Facades\DB;
 
 return new class extends Migration
 {
+    private function isPgsql(): bool
+    {
+        return DB::getDriverName() === 'pgsql';
+    }
+
     /**
-     * Upgrade messages table to support:
-     * - student/guest -> counselor
-     * - counselor -> student/guest
-     * - counselor -> counselor
-     *
-     * We keep the existing "is_read" as the STUDENT/GUEST read flag (so the current student UI stays compatible),
-     * and introduce "counselor_is_read" for the counselor side.
+     * Check if a foreign key exists on a given table+column (PostgreSQL).
      */
+    private function pgForeignKeyExists(string $table, string $column): bool
+    {
+        $row = DB::selectOne(
+            "
+            SELECT 1
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.constraint_schema = kcu.constraint_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_name = ?
+              AND kcu.column_name = ?
+            LIMIT 1
+            ",
+            [$table, $column]
+        );
+
+        return $row !== null;
+    }
+
+    /**
+     * Safely drop the accidental FK constraint named "1" if it exists on messages.
+     * This only drops it when it is a FOREIGN KEY on the messages table.
+     */
+    private function dropBadConstraintOneIfPresent(): void
+    {
+        if (! $this->isPgsql()) return;
+
+        $row = DB::selectOne(
+            "
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'messages'::regclass
+              AND contype = 'f'
+              AND conname = '1'
+            LIMIT 1
+            "
+        );
+
+        if ($row) {
+            DB::statement('ALTER TABLE "messages" DROP CONSTRAINT IF EXISTS "1"');
+        }
+    }
+
     public function up(): void
     {
+        // If you previously ran the broken version, it may have left FK constraint "1".
+        $this->dropBadConstraintOneIfPresent();
+
+        // 1) Add columns (NO constrained() here to avoid FK naming issues)
         Schema::table('messages', function (Blueprint $table) {
-            // Who authored the message (user record, if applicable)
-            if (!Schema::hasColumn('messages', 'sender_id')) {
-                $table->foreignId('sender_id')
-                    ->nullable()
-                    ->after('user_id')
-                    ->constrained('users')
-                    ->nullOnDelete();
+            if (! Schema::hasColumn('messages', 'sender_id')) {
+                $table->foreignId('sender_id')->nullable();
             }
 
-            // Who receives the message (user record, if applicable)
-            if (!Schema::hasColumn('messages', 'recipient_id')) {
-                $table->foreignId('recipient_id')
-                    ->nullable()
-                    ->after('sender_id')
-                    ->constrained('users')
-                    ->nullOnDelete();
+            if (! Schema::hasColumn('messages', 'recipient_id')) {
+                $table->foreignId('recipient_id')->nullable();
             }
 
-            // Recipient role group ("counselor", "student", "guest")
-            if (!Schema::hasColumn('messages', 'recipient_role')) {
-                $table->string('recipient_role', 50)
-                    ->nullable()
-                    ->after('recipient_id');
+            if (! Schema::hasColumn('messages', 'recipient_role')) {
+                $table->string('recipient_role', 50)->nullable();
             }
 
-            // Thread identifier (for grouping)
-            if (!Schema::hasColumn('messages', 'conversation_id')) {
-                $table->string('conversation_id', 120)
-                    ->nullable()
-                    ->after('recipient_role');
-
-                $table->index('conversation_id');
+            if (! Schema::hasColumn('messages', 'conversation_id')) {
+                $table->string('conversation_id', 120)->nullable();
             }
 
-            // Counselor read flag (separate from student read flag)
-            if (!Schema::hasColumn('messages', 'counselor_is_read')) {
-                $table->boolean('counselor_is_read')
-                    ->default(false)
-                    ->after('is_read');
-
-                $table->index('counselor_is_read');
+            if (! Schema::hasColumn('messages', 'counselor_is_read')) {
+                $table->boolean('counselor_is_read')->default(false);
             }
 
-            // Optional read timestamps
-            if (!Schema::hasColumn('messages', 'student_read_at')) {
-                $table->timestamp('student_read_at')
-                    ->nullable()
-                    ->after('is_read');
+            if (! Schema::hasColumn('messages', 'student_read_at')) {
+                $table->timestamp('student_read_at')->nullable();
             }
 
-            if (!Schema::hasColumn('messages', 'counselor_read_at')) {
-                $table->timestamp('counselor_read_at')
-                    ->nullable()
-                    ->after('counselor_is_read');
-            }
-
-            // Helpful indexes for inbox queries
-            if (!Schema::hasColumn('messages', 'recipient_role')) {
-                // (already created above if missing)
-            } else {
-                $table->index('recipient_role');
-            }
-
-            if (!Schema::hasColumn('messages', 'recipient_id')) {
-                // (already created above if missing)
-            } else {
-                $table->index('recipient_id');
+            if (! Schema::hasColumn('messages', 'counselor_read_at')) {
+                $table->timestamp('counselor_read_at')->nullable();
             }
         });
 
-        /**
-         * Backfill existing records so counselor inbox can see old student messages.
-         * Old table assumption:
-         * - user_id points to the student owner
-         * - sender is "student" / "counselor" / "system"
-         * - is_read is student read status
-         */
+        // 2) Add foreign keys only if missing (Postgres-safe)
+        if ($this->isPgsql()) {
+            if (Schema::hasColumn('messages', 'sender_id') && ! $this->pgForeignKeyExists('messages', 'sender_id')) {
+                Schema::table('messages', function (Blueprint $table) {
+                    $table->foreign('sender_id', 'messages_sender_id_foreign')
+                        ->references('id')
+                        ->on('users')
+                        ->nullOnDelete();
+                });
+            }
 
-        // If sender is student/guest and sender_id is missing, set sender_id = user_id
-        DB::statement("UPDATE messages SET sender_id = user_id WHERE sender_id IS NULL AND sender IN ('student','guest')");
+            if (Schema::hasColumn('messages', 'recipient_id') && ! $this->pgForeignKeyExists('messages', 'recipient_id')) {
+                Schema::table('messages', function (Blueprint $table) {
+                    $table->foreign('recipient_id', 'messages_recipient_id_foreign')
+                        ->references('id')
+                        ->on('users')
+                        ->nullOnDelete();
+                });
+            }
+        } else {
+            // If you ever switch DBs, you can extend this; for now your environment is pgsql.
+        }
 
-        // Default recipient_role based on sender
-        // student/guest messages go to counselor office
-        DB::statement("UPDATE messages SET recipient_role = 'counselor' WHERE recipient_role IS NULL AND sender IN ('student','guest')");
+        // 3) Create indexes (Postgres: IF NOT EXISTS avoids duplicate errors)
+        if ($this->isPgsql()) {
+            DB::statement('CREATE INDEX IF NOT EXISTS messages_sender_id_idx ON messages(sender_id)');
+            DB::statement('CREATE INDEX IF NOT EXISTS messages_recipient_id_idx ON messages(recipient_id)');
+            DB::statement('CREATE INDEX IF NOT EXISTS messages_recipient_role_idx ON messages(recipient_role)');
+            DB::statement('CREATE INDEX IF NOT EXISTS messages_conversation_id_idx ON messages(conversation_id)');
+            DB::statement('CREATE INDEX IF NOT EXISTS messages_counselor_is_read_idx ON messages(counselor_is_read)');
+        }
 
-        // counselor/system messages go to the student owner
-        DB::statement("UPDATE messages SET recipient_role = 'student' WHERE recipient_role IS NULL AND sender IN ('counselor','system')");
+        // 4) Backfill (Postgres boolean-safe)
+        if (Schema::hasColumn('messages', 'sender_id')) {
+            DB::table('messages')
+                ->whereNull('sender_id')
+                ->whereIn('sender', ['student', 'guest'])
+                ->update(['sender_id' => DB::raw('user_id')]);
+        }
 
-        // Create a conversation_id for all old messages based on user_id (student thread)
-        DB::statement("UPDATE messages SET conversation_id = CONCAT('student-', user_id) WHERE conversation_id IS NULL AND user_id IS NOT NULL");
+        if (Schema::hasColumn('messages', 'recipient_role')) {
+            DB::table('messages')
+                ->whereNull('recipient_role')
+                ->whereIn('sender', ['student', 'guest'])
+                ->update(['recipient_role' => 'counselor']);
 
-        // If is_read is true, set student_read_at if missing (best-effort)
-        DB::statement("UPDATE messages SET student_read_at = created_at WHERE is_read = 1 AND student_read_at IS NULL");
+            DB::table('messages')
+                ->whereNull('recipient_role')
+                ->whereIn('sender', ['counselor', 'system'])
+                ->update(['recipient_role' => 'student']);
+        }
 
-        // For counselor/system messages, counselor_is_read can be true since counselor authored them (optional)
-        DB::statement("UPDATE messages SET counselor_is_read = 1 WHERE sender IN ('counselor','system') AND counselor_is_read = 0");
+        if (Schema::hasColumn('messages', 'conversation_id')) {
+            DB::table('messages')
+                ->whereNull('conversation_id')
+                ->whereNotNull('user_id')
+                ->update(['conversation_id' => DB::raw("CONCAT('student-', user_id)")]);
+        }
+
+        if (Schema::hasColumn('messages', 'student_read_at')) {
+            DB::table('messages')
+                ->where('is_read', true)
+                ->whereNull('student_read_at')
+                ->update(['student_read_at' => DB::raw('created_at')]);
+        }
+
+        if (Schema::hasColumn('messages', 'counselor_is_read')) {
+            DB::table('messages')
+                ->whereIn('sender', ['counselor', 'system'])
+                ->where('counselor_is_read', false)
+                ->update(['counselor_is_read' => true]);
+        }
+
+        if (Schema::hasColumn('messages', 'counselor_read_at')) {
+            DB::table('messages')
+                ->where('counselor_is_read', true)
+                ->whereNull('counselor_read_at')
+                ->update(['counselor_read_at' => DB::raw('created_at')]);
+        }
     }
 
     public function down(): void
     {
+        // Drop the bad constraint if it exists (from old broken migrations)
+        $this->dropBadConstraintOneIfPresent();
+
+        if ($this->isPgsql()) {
+            DB::statement('DROP INDEX IF EXISTS messages_sender_id_idx');
+            DB::statement('DROP INDEX IF EXISTS messages_recipient_id_idx');
+            DB::statement('DROP INDEX IF EXISTS messages_recipient_role_idx');
+            DB::statement('DROP INDEX IF EXISTS messages_conversation_id_idx');
+            DB::statement('DROP INDEX IF EXISTS messages_counselor_is_read_idx');
+        }
+
         Schema::table('messages', function (Blueprint $table) {
+            // Drop FKs if they exist
             if (Schema::hasColumn('messages', 'sender_id')) {
-                $table->dropConstrainedForeignId('sender_id');
+                try { $table->dropForeign('messages_sender_id_foreign'); } catch (\Throwable $e) {}
             }
 
             if (Schema::hasColumn('messages', 'recipient_id')) {
-                $table->dropConstrainedForeignId('recipient_id');
+                try { $table->dropForeign('messages_recipient_id_foreign'); } catch (\Throwable $e) {}
             }
 
-            if (Schema::hasColumn('messages', 'recipient_role')) {
-                $table->dropColumn('recipient_role');
-            }
+            // Drop columns
+            $cols = [
+                'sender_id',
+                'recipient_id',
+                'recipient_role',
+                'conversation_id',
+                'counselor_is_read',
+                'student_read_at',
+                'counselor_read_at',
+            ];
 
-            if (Schema::hasColumn('messages', 'conversation_id')) {
-                $table->dropIndex(['conversation_id']);
-                $table->dropColumn('conversation_id');
+            foreach ($cols as $c) {
+                if (Schema::hasColumn('messages', $c)) {
+                    $table->dropColumn($c);
+                }
             }
-
-            if (Schema::hasColumn('messages', 'counselor_is_read')) {
-                $table->dropIndex(['counselor_is_read']);
-                $table->dropColumn('counselor_is_read');
-            }
-
-            if (Schema::hasColumn('messages', 'student_read_at')) {
-                $table->dropColumn('student_read_at');
-            }
-
-            if (Schema::hasColumn('messages', 'counselor_read_at')) {
-                $table->dropColumn('counselor_read_at');
-            }
-
-            // recipient_role / recipient_id indexes
-            // (Laravel will auto-drop indexes when dropping columns; kept safe here)
         });
     }
 };
