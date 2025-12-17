@@ -144,19 +144,20 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
 /*
 |--------------------------------------------------------------------------
-| ✅ Directory endpoints (fix 404 for /students, /guests, /counselors, /admins, /users?role=...)
+| ✅ Directory endpoints
 |--------------------------------------------------------------------------
 |
 | IMPORTANT:
 | - We filter by `users.role` (NOT account_type).
-| - Used by counselor "New Message" recipient search.
+| - Student/Guest must be able to list COUNSELORS (to start a message).
+| - Only Counselor/Admin can list Students/Guests/Admins.
 |
 | Supported query params:
 | - limit | per_page (default 20, max 100)
 | - search | q | query
 */
 
-function directoryCanListUsers(?User $actor): bool
+function directoryCanListUsers(?User $actor, string $targetRole): bool
 {
     if (! $actor) return false;
 
@@ -167,6 +168,12 @@ function directoryCanListUsers(?User $actor): bool
 
     $isAdmin = str_contains($actorRole, 'admin');
 
+    $target = strtolower(trim($targetRole));
+
+    // ✅ Anyone authenticated may list counselors (needed by StudentMessages.tsx)
+    if ($target === 'counselor') return true;
+
+    // ✅ Only counselor/admin can list other roles
     return $isCounselor || $isAdmin;
 }
 
@@ -206,7 +213,7 @@ function directoryResponse(Request $request, string $role)
         return response()->json(['message' => 'Unauthenticated.'], 401);
     }
 
-    if (! directoryCanListUsers($actor)) {
+    if (! directoryCanListUsers($actor, $role)) {
         return response()->json(['message' => 'Forbidden.'], 403);
     }
 
