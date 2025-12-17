@@ -4,8 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Models\Message;
 use App\Models\User;
+use App\Models\MessageConversationDeletion;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 
 class StudentMessageController extends Controller
 {
@@ -18,12 +20,49 @@ class StudentMessageController extends Controller
     }
 
     /**
+     * Build the same "conversation id" key the Student UI uses.
+     *
+     * Frontend logic:
+     * - Prefer message.conversation_id if present
+     * - else derive counselor-{id} from sender/recipient
+     * - else counselor-office
+     */
+    private function conversationKey(Message $message): string
+    {
+        $raw = $message->conversation_id ?? null;
+        if ($raw !== null && trim((string) $raw) !== '') {
+            return (string) $raw;
+        }
+
+        $sender = strtolower((string) ($message->sender ?? ''));
+        $senderId = $message->sender_id ?? null;
+
+        $recipientRole = strtolower((string) ($message->recipient_role ?? ''));
+        $recipientId = $message->recipient_id ?? null;
+
+        $counselorId = null;
+
+        if ($sender === 'counselor' && $senderId !== null && trim((string) $senderId) !== '') {
+            $counselorId = $senderId;
+        } elseif ($recipientRole === 'counselor' && $recipientId !== null && trim((string) $recipientId) !== '') {
+            $counselorId = $recipientId;
+        }
+
+        if ($counselorId !== null && trim((string) $counselorId) !== '') {
+            return 'counselor-' . (string) $counselorId;
+        }
+
+        return 'counselor-office';
+    }
+
+    /**
      * GET /student/messages
      *
      * Fetch all messages for the authenticated student/guest.
      *
-     * IMPORTANT:
-     * Student UI expects "is_read" to be the student read flag.
+     * ✅ FIXED:
+     * Respect "conversation deletions" so deleted threads stay hidden after refresh.
+     * If a conversation was deleted at time T, only show messages created AFTER T.
      */
     public function index(Request $request): JsonResponse
     {
@@ -35,15 +74,48 @@ class StudentMessageController extends Controller
             ], 401);
         }
 
+        // Load deletion cutoffs for this user (conversation_id => deleted_at)
+        $deletions = MessageConversationDeletion::query()
+            ->where('user_id', (int) $user->id)
+            ->whereNotNull('deleted_at')
+            ->get(['conversation_id', 'deleted_at']);
+
+        $deletedAtByConversation = [];
+        foreach ($deletions as $d) {
+            $key = trim((string) ($d->conversation_id ?? ''));
+            if ($key === '') continue;
+            $deletedAtByConversation[$key] = $d->deleted_at; // Carbon (cast)
+        }
+
+        // Fetch all messages for this user
         $messages = Message::query()
             ->where('user_id', $user->id)
             ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
 
+        // Filter out messages that are "before or at" the delete cutoff for that conversation
+        $visibleMessages = $messages->filter(function (Message $m) use ($deletedAtByConversation) {
+            $key = $this->conversationKey($m);
+
+            if (! array_key_exists($key, $deletedAtByConversation)) {
+                return true;
+            }
+
+            $cutoff = $deletedAtByConversation[$key] ?? null;
+            if (! $cutoff) return true;
+
+            $createdAt = $m->created_at instanceof Carbon
+                ? $m->created_at
+                : Carbon::parse((string) $m->created_at);
+
+            // Only show messages strictly after the deletion moment
+            return $createdAt->gt($cutoff);
+        })->values();
+
         return response()->json([
             'message'  => 'Fetched your messages.',
-            'messages' => $messages,
+            'messages' => $visibleMessages,
         ]);
     }
 
