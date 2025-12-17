@@ -3,11 +3,20 @@
 namespace App\Http\Controllers;
 
 use App\Models\Message;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class StudentMessageController extends Controller
 {
+    private function isCounselor(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+        return str_contains($role, 'counselor') || str_contains($role, 'counsellor');
+    }
+
     /**
      * GET /student/messages
      *
@@ -43,9 +52,10 @@ class StudentMessageController extends Controller
      *
      * Create a new message authored by the current student OR guest.
      *
-     * This is always routed to the counselor office:
-     *   recipient_role = counselor
-     *   recipient_id   = null (office inbox)
+     * Supports optional UI fields:
+     *   - recipient_role (must be counselor if provided)
+     *   - recipient_id (optional; if provided must be a counselor user)
+     *   - conversation_id (hint; will be normalized to the canonical student thread)
      */
     public function store(Request $request): JsonResponse
     {
@@ -59,10 +69,51 @@ class StudentMessageController extends Controller
 
         $data = $request->validate([
             'content' => ['required', 'string'],
+
+            // UI may send these; we keep them optional but safe.
+            'recipient_role' => ['nullable', 'in:counselor'],
+            'recipient_id'   => ['nullable', 'integer', 'exists:users,id'],
+
+            // Accept string OR integer conversation ids from the frontend
+            'conversation_id' => [
+                'nullable',
+                function ($attribute, $value, $fail) {
+                    if ($value === null) return;
+                    if (! is_string($value) && ! is_int($value)) {
+                        $fail('conversation_id must be a string or integer.');
+                        return;
+                    }
+                    if (strlen((string) $value) > 120) {
+                        $fail('conversation_id may not be greater than 120 characters.');
+                    }
+                },
+            ],
         ]);
 
         $role = strtolower((string) ($user->role ?? 'student'));
         $senderRole = str_contains($role, 'guest') ? 'guest' : 'student';
+
+        $recipientId = isset($data['recipient_id']) ? (int) $data['recipient_id'] : null;
+
+        // If a specific recipient counselor is provided, verify they are actually a counselor.
+        if ($recipientId) {
+            $recipientUser = User::find($recipientId);
+            if (! $recipientUser || ! $this->isCounselor($recipientUser)) {
+                return response()->json([
+                    'message' => 'Recipient is not a counselor.',
+                ], 422);
+            }
+        }
+
+        // Canonical conversation id for the student/guest thread
+        $canonicalConversationId = "student-{$user->id}";
+
+        // Accept the provided conversation_id only if it matches the canonical thread id.
+        // (Prevents clients from spoofing/mixing threads.)
+        $conversationHint = $data['conversation_id'] ?? null;
+        $conversationId = ((string) $conversationHint === $canonicalConversationId)
+            ? $canonicalConversationId
+            : $canonicalConversationId;
 
         $message = new Message();
         $message->user_id     = $user->id;
@@ -72,10 +123,9 @@ class StudentMessageController extends Controller
         $message->sender_name = $user->name ?? null;
 
         $message->recipient_role = 'counselor';
-        $message->recipient_id   = null;
+        $message->recipient_id   = $recipientId; // null = office inbox; int = direct counselor
 
-        // Stable thread id per student/guest
-        $message->conversation_id = "student-{$user->id}";
+        $message->conversation_id = $conversationId;
 
         $message->content = $data['content'];
 

@@ -40,7 +40,7 @@ class CounselorMessageController extends Controller
         }
 
         // Counselor office thread (broadcast/group)
-        if ($recipientRole === 'counselor' && !$recipientId) {
+        if ($recipientRole === 'counselor' && ! $recipientId) {
             return "counselor-office";
         }
 
@@ -50,14 +50,14 @@ class CounselorMessageController extends Controller
     /**
      * GET /counselor/messages
      *
-     * Returns messages relevant to the counselor:
-     * - inbound student/guest -> counselor inbox (recipient_role=counselor)
-     * - counselor -> counselor (direct or office)
-     * - messages the counselor sent (sender_id = counselor.id, sender=counselor)
+     * Returns messages relevant to counselors.
      *
-     * IMPORTANT:
-     * For counselor responses, we alias counselor_is_read as is_read in the response,
-     * so the frontend can still treat is_read consistently in counselor context.
+     * IMPORTANT CHANGE:
+     * - Include ALL messages in student threads (conversation_id LIKE 'student-%'),
+     *   so counselors can see complete conversations even if another counselor replied.
+     *
+     * Read flag behavior:
+     * - For counselor context, we alias counselor_is_read as is_read in the response.
      */
     public function index(Request $request): JsonResponse
     {
@@ -73,7 +73,7 @@ class CounselorMessageController extends Controller
 
         $messages = Message::query()
             ->where(function ($q) use ($user) {
-                // Messages sent TO counselor (direct or office inbox)
+                // 1) Counselor inbox (direct or office): includes student/guest -> counselor messages
                 $q->where(function ($q2) use ($user) {
                     $q2->where('recipient_role', 'counselor')
                         ->where(function ($q3) use ($user) {
@@ -81,7 +81,14 @@ class CounselorMessageController extends Controller
                                 ->orWhere('recipient_id', $user->id);
                         });
                 })
-                // Messages sent BY counselor (so they can see sent items in same feed if needed)
+
+                // 2) All student threads (full conversation history, regardless of which counselor sent replies)
+                ->orWhere(function ($q2) {
+                    $q2->whereNotNull('conversation_id')
+                        ->where('conversation_id', 'like', 'student-%');
+                })
+
+                // 3) Also include anything the current counselor sent (compatibility / sent-items)
                 ->orWhere(function ($q2) use ($user) {
                     $q2->where('sender', 'counselor')
                         ->where('sender_id', $user->id);
@@ -115,12 +122,16 @@ class CounselorMessageController extends Controller
      * POST /counselor/messages
      *
      * Body:
-     *   { content: string, recipient_role?: student|guest|counselor, recipient_id?: int, conversation_id?: string }
+     *   { content: string, recipient_role?: student|guest|counselor, recipient_id?: int, conversation_id?: string|int }
      *
      * Rules:
      * - counselor may send to student, guest, or counselor
-     * - if recipient_role is student/guest/counselor (direct), recipient_id is required
+     * - if recipient_role is student/guest (direct), recipient_id is required
      * - if recipient_role is counselor and recipient_id is null => counselor-office broadcast (allowed)
+     *
+     * NOTE:
+     * - conversation_id from the client is treated as a hint; we normalize to a canonical id
+     *   for the given sender/recipient pair to keep threads consistent.
      */
     public function store(Request $request): JsonResponse
     {
@@ -138,7 +149,21 @@ class CounselorMessageController extends Controller
             'content' => ['required', 'string'],
             'recipient_role' => ['nullable', 'in:student,guest,counselor'],
             'recipient_id' => ['nullable', 'integer', 'exists:users,id'],
-            'conversation_id' => ['nullable', 'string', 'max:120'],
+
+            // Accept string OR integer conversation ids from the frontend
+            'conversation_id' => [
+                'nullable',
+                function ($attribute, $value, $fail) {
+                    if ($value === null) return;
+                    if (! is_string($value) && ! is_int($value)) {
+                        $fail('conversation_id must be a string or integer.');
+                        return;
+                    }
+                    if (strlen((string) $value) > 120) {
+                        $fail('conversation_id may not be greater than 120 characters.');
+                    }
+                },
+            ],
         ]);
 
         $recipientRole = $data['recipient_role'] ?? 'counselor';
@@ -149,10 +174,6 @@ class CounselorMessageController extends Controller
             return response()->json([
                 'message' => 'recipient_id is required for student/guest recipients.',
             ], 422);
-        }
-
-        if ($recipientRole === 'counselor' && $recipientId) {
-            // direct counselor-to-counselor message
         }
 
         // If sending to a specific user, ensure their role matches expected (student/guest/counselor)
@@ -177,10 +198,20 @@ class CounselorMessageController extends Controller
             }
         }
 
-        // conversation id
-        $conversationId =
-            $data['conversation_id']
-            ?? $this->conversationIdFor('counselor', (int) $user->id, $recipientRole, $recipientId, null);
+        // Canonical conversation id (keeps student threads stable and counselor threads deterministic)
+        $canonicalConversationId = $this->conversationIdFor(
+            'counselor',
+            (int) $user->id,
+            $recipientRole,
+            $recipientId,
+            null
+        );
+
+        // Use the canonical id; only accept the provided hint if it exactly matches.
+        $conversationHint = $data['conversation_id'] ?? null;
+        $conversationId = ((string) $conversationHint === $canonicalConversationId)
+            ? $canonicalConversationId
+            : $canonicalConversationId;
 
         $message = new Message();
         $message->sender = 'counselor';
