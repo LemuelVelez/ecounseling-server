@@ -7,13 +7,9 @@ return [
     | Cross-Origin Resource Sharing (CORS) Configuration
     |--------------------------------------------------------------------------
     |
-    | This configuration allows your React SPA on http://localhost:5173
-    | to call the Laravel backend on http://localhost:8000 with cookies
-    | (credentials: "include").
-    |
     */
 
-    // ✅ Enable CORS on ALL routes your SPA may call (including “directory” endpoints).
+    // ✅ Enable CORS on ALL routes your SPA may call (including conversation delete endpoints).
     'paths' => [
         'auth/*',
 
@@ -21,6 +17,12 @@ return [
         'student/*',
         'counselor/*',
         'admin/*',
+
+        // ✅ conversation/thread delete endpoints used by the frontend
+        'messages',
+        'messages/*',
+        'conversations',
+        'conversations/*',
 
         // ✅ directory/list endpoints your frontend is calling
         'users',
@@ -35,7 +37,7 @@ return [
         'guests',
         'guests/*',
 
-        // ✅ NEW: admins directory/list endpoints (fix CORS for /admins)
+        // ✅ admins directory/list endpoints
         'admins',
         'admins/*',
 

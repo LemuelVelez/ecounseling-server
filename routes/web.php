@@ -4,6 +4,7 @@ use App\Http\Controllers\AuthController;
 use App\Http\Controllers\IntakeController;
 use App\Http\Controllers\StudentMessageController;
 use App\Http\Controllers\CounselorMessageController;
+use App\Http\Controllers\MessageConversationController;
 use App\Http\Controllers\StudentProfileController;
 use App\Http\Controllers\Admin\AdminRoleController;
 use App\Http\Controllers\Admin\AdminUserController;
@@ -39,6 +40,30 @@ Route::prefix('auth')->group(function () {
     Route::post('password/reset', [AuthController::class, 'resetPassword'])
         ->name('auth.password.reset');
 });
+
+/*
+|--------------------------------------------------------------------------
+| ✅ Conversation delete endpoints (persist delete across refresh)
+|--------------------------------------------------------------------------
+|
+| Frontend tries these candidates:
+| - DELETE /messages/conversations/{conversationId}
+| - DELETE /conversations/{conversationId}
+| - DELETE /messages/thread/{conversationId}
+|
+| We implement all 3 and "delete" means: hide for the current user only.
+*/
+Route::middleware('auth')->delete('messages/conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
+    ->where('conversationId', '.+')
+    ->name('messages.conversations.destroy');
+
+Route::middleware('auth')->delete('messages/thread/{conversationId}', [MessageConversationController::class, 'destroy'])
+    ->where('conversationId', '.+')
+    ->name('messages.thread.destroy');
+
+Route::middleware('auth')->delete('conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
+    ->where('conversationId', '.+')
+    ->name('conversations.destroy');
 
 /*
 |--------------------------------------------------------------------------
@@ -146,15 +171,7 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 |--------------------------------------------------------------------------
 | ✅ Directory endpoints
 |--------------------------------------------------------------------------
-|
-| IMPORTANT:
-| - We filter by `users.role` (NOT account_type).
-| - Student/Guest must be able to list COUNSELORS (to start a message).
-| - Only Counselor/Admin can list Students/Guests/Admins.
-|
-| Supported query params:
-| - limit | per_page (default 20, max 100)
-| - search | q | query
+| (unchanged below)
 */
 
 function directoryCanListUsers(?User $actor, string $targetRole): bool
@@ -269,10 +286,6 @@ Route::middleware('auth')->get('admins', function (Request $request) {
     return directoryResponse($request, 'admin');
 });
 
-/**
- * Generic endpoint used by the frontend fallback:
- * GET /users?role=student|guest|counselor|admin
- */
 Route::middleware('auth')->get('users', function (Request $request) {
     $role = (string) $request->query('role', '');
     $role = trim($role);

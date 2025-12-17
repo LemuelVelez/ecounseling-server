@@ -6,6 +6,7 @@ use App\Models\Message;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class CounselorMessageController extends Controller
 {
@@ -50,11 +51,9 @@ class CounselorMessageController extends Controller
     /**
      * GET /counselor/messages
      *
-     * Returns messages relevant to counselors.
-     *
-     * IMPORTANT CHANGE:
-     * - Include ALL messages in student threads (conversation_id LIKE 'student-%'),
-     *   so counselors can see complete conversations even if another counselor replied.
+     * IMPORTANT FIX:
+     * - Exclude conversations deleted by THIS counselor (persistently) using message_conversation_deletions.
+     * - If new messages arrive after deletion, they will show again (only newer than deleted_at).
      *
      * Read flag behavior:
      * - For counselor context, we alias counselor_is_read as is_read in the response.
@@ -71,45 +70,57 @@ class CounselorMessageController extends Controller
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
+        // Effective conversation id used in joins + response (covers any legacy nulls)
+        $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
+
         $messages = Message::query()
+            ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($user, $effectiveConversationIdSql) {
+                $join->on(DB::raw($effectiveConversationIdSql), '=', 'mcd.conversation_id')
+                    ->where('mcd.user_id', '=', (int) $user->id);
+            })
             ->where(function ($q) use ($user) {
                 // 1) Counselor inbox (direct or office): includes student/guest -> counselor messages
                 $q->where(function ($q2) use ($user) {
-                    $q2->where('recipient_role', 'counselor')
+                    $q2->where('messages.recipient_role', 'counselor')
                         ->where(function ($q3) use ($user) {
-                            $q3->whereNull('recipient_id')
-                                ->orWhere('recipient_id', $user->id);
+                            $q3->whereNull('messages.recipient_id')
+                                ->orWhere('messages.recipient_id', $user->id);
                         });
                 })
 
                 // 2) All student threads (full conversation history, regardless of which counselor sent replies)
                 ->orWhere(function ($q2) {
-                    $q2->whereNotNull('conversation_id')
-                        ->where('conversation_id', 'like', 'student-%');
+                    $q2->whereNotNull('messages.conversation_id')
+                        ->where('messages.conversation_id', 'like', 'student-%');
                 })
 
                 // 3) Also include anything the current counselor sent (compatibility / sent-items)
                 ->orWhere(function ($q2) use ($user) {
-                    $q2->where('sender', 'counselor')
-                        ->where('sender_id', $user->id);
+                    $q2->where('messages.sender', 'counselor')
+                        ->where('messages.sender_id', $user->id);
                 });
             })
-            ->orderBy('created_at', 'asc')
-            ->orderBy('id', 'asc')
+            // ✅ Hide conversations deleted by this counselor (unless message is newer than deletion timestamp)
+            ->where(function ($q) {
+                $q->whereNull('mcd.deleted_at')
+                    ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
+            })
+            ->orderBy('messages.created_at', 'asc')
+            ->orderBy('messages.id', 'asc')
             ->select([
-                'id',
-                'user_id',
-                'sender',
-                'sender_id',
-                'sender_name',
-                'recipient_id',
-                'recipient_role',
-                'conversation_id',
-                'content',
-                'created_at',
-                'updated_at',
+                'messages.id',
+                'messages.user_id',
+                'messages.sender',
+                'messages.sender_id',
+                'messages.sender_name',
+                'messages.recipient_id',
+                'messages.recipient_role',
+                'messages.content',
+                'messages.created_at',
+                'messages.updated_at',
             ])
-            ->selectRaw('counselor_is_read as is_read')
+            ->selectRaw($effectiveConversationIdSql . ' as conversation_id')
+            ->selectRaw('messages.counselor_is_read as is_read')
             ->get();
 
         return response()->json([
@@ -120,18 +131,6 @@ class CounselorMessageController extends Controller
 
     /**
      * POST /counselor/messages
-     *
-     * Body:
-     *   { content: string, recipient_role?: student|guest|counselor, recipient_id?: int, conversation_id?: string|int }
-     *
-     * Rules:
-     * - counselor may send to student, guest, or counselor
-     * - if recipient_role is student/guest (direct), recipient_id is required
-     * - if recipient_role is counselor and recipient_id is null => counselor-office broadcast (allowed)
-     *
-     * NOTE:
-     * - conversation_id from the client is treated as a hint; we normalize to a canonical id
-     *   for the given sender/recipient pair to keep threads consistent.
      */
     public function store(Request $request): JsonResponse
     {
@@ -276,12 +275,6 @@ class CounselorMessageController extends Controller
 
     /**
      * POST /counselor/messages/mark-as-read
-     *
-     * Body:
-     *   { message_ids?: int[] }
-     *
-     * Marks counselor_is_read = true for messages received by counselor inbox:
-     * - recipient_role=counselor and (recipient_id is null OR recipient_id = current counselor)
      */
     public function markAsRead(Request $request): JsonResponse
     {

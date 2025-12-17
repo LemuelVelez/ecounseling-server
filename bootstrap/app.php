@@ -33,6 +33,12 @@ return Application::configure(basePath: dirname(__DIR__))
                 'counselor/*',
                 'admin/*',
 
+                // ✅ conversation/thread delete endpoints used by the frontend
+                'messages',
+                'messages/*',
+                'conversations',
+                'conversations/*',
+
                 // ✅ directory endpoints your UI calls
                 'users',
                 'users/*',
@@ -46,7 +52,6 @@ return Application::configure(basePath: dirname(__DIR__))
                 'guests',
                 'guests/*',
 
-                // ✅ NEW: admins directory endpoints
                 'admins',
                 'admins/*',
             ],
