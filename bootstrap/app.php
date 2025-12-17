@@ -3,6 +3,7 @@
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Http\Middleware\HandleCors;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -12,26 +13,42 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         /**
+         * ✅ Ensure CORS headers are actually applied.
+         * In Laravel 11/12, CORS is handled by middleware + config/cors.php.
+         */
+        $middleware->append(HandleCors::class);
+
+        /**
          * CSRF configuration for Laravel 11/12 + React SPA.
          *
          * We keep CSRF enabled for normal web routes, but we skip CSRF
-         * validation for the JSON endpoints your SPA calls directly:
-         *   - /auth/*      (login, register, logout, me, etc.)
-         *   - /student/*   (student endpoints)
-         *   - /counselor/* (✅ counselor endpoints)
-         *   - /admin/*     (admin endpoints)
-         *
-         * These routes are still protected by:
-         *   - The session cookie (sent with credentials: "include")
-         *   - The "auth" middleware (and/or your role checks) on protected routes
+         * validation for JSON endpoints your SPA calls directly.
          */
-
         $middleware->validateCsrfTokens(
             except: [
                 'auth/*',
+
+                // existing
                 'student/*',
                 'counselor/*',
                 'admin/*',
+
+                // ✅ directory endpoints your UI calls
+                'users',
+                'users/*',
+
+                'students',
+                'students/*',
+
+                'counselors',
+                'counselors/*',
+
+                'guests',
+                'guests/*',
+
+                // ✅ NEW: admins directory endpoints
+                'admins',
+                'admins/*',
             ],
         );
     })

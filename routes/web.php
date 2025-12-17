@@ -7,6 +7,8 @@ use App\Http\Controllers\CounselorMessageController;
 use App\Http\Controllers\StudentProfileController;
 use App\Http\Controllers\Admin\AdminRoleController;
 use App\Http\Controllers\Admin\AdminUserController;
+use App\Models\User;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
@@ -129,7 +131,7 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
     Route::delete('intake/requests/{intake}', [IntakeController::class, 'counselorDeleteAppointment'])
         ->name('counselor.intake.requests.delete');
 
-    // ✅ NEW: Counselor messages endpoints
+    // ✅ Counselor messages endpoints
     Route::get('messages', [CounselorMessageController::class, 'index'])
         ->name('counselor.messages.index');
 
@@ -138,6 +140,143 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
     Route::post('messages/mark-as-read', [CounselorMessageController::class, 'markAsRead'])
         ->name('counselor.messages.markAsRead');
+});
+
+/*
+|--------------------------------------------------------------------------
+| ✅ Directory endpoints (fix 404 for /students, /guests, /counselors, /admins, /users?role=...)
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| - We filter by `users.role` (NOT account_type).
+| - Used by counselor "New Message" recipient search.
+|
+| Supported query params:
+| - limit | per_page (default 20, max 100)
+| - search | q | query
+*/
+
+function directoryCanListUsers(?User $actor): bool
+{
+    if (! $actor) return false;
+
+    $actorRole = strtolower((string) ($actor->role ?? ''));
+    $isCounselor = str_contains($actorRole, 'counselor')
+        || str_contains($actorRole, 'counsellor')
+        || str_contains($actorRole, 'guidance');
+
+    $isAdmin = str_contains($actorRole, 'admin');
+
+    return $isCounselor || $isAdmin;
+}
+
+function applyDirectoryRoleFilter($query, string $role)
+{
+    $r = strtolower(trim($role));
+
+    if ($r === 'student') {
+        return $query->whereRaw('LOWER(role) LIKE ?', ['%student%']);
+    }
+
+    if ($r === 'guest') {
+        return $query->whereRaw('LOWER(role) LIKE ?', ['%guest%']);
+    }
+
+    if ($r === 'counselor') {
+        return $query->where(function ($q) {
+            $q->whereRaw('LOWER(role) LIKE ?', ['%counselor%'])
+              ->orWhereRaw('LOWER(role) LIKE ?', ['%counsellor%'])
+              ->orWhereRaw('LOWER(role) LIKE ?', ['%guidance%']);
+        });
+    }
+
+    if ($r === 'admin') {
+        return $query->whereRaw('LOWER(role) LIKE ?', ['%admin%']);
+    }
+
+    // Unknown role => return none (safer than returning everyone)
+    return $query->whereRaw('1 = 0');
+}
+
+function directoryResponse(Request $request, string $role)
+{
+    $actor = $request->user();
+
+    if (! $actor) {
+        return response()->json(['message' => 'Unauthenticated.'], 401);
+    }
+
+    if (! directoryCanListUsers($actor)) {
+        return response()->json(['message' => 'Forbidden.'], 403);
+    }
+
+    $limitRaw = $request->query('limit', $request->query('per_page', 20));
+    $limit = (int) $limitRaw;
+    if ($limit < 1) $limit = 20;
+    if ($limit > 100) $limit = 100;
+
+    $search = (string) ($request->query('search', $request->query('q', $request->query('query', ''))));
+    $search = trim($search);
+
+    $query = User::query();
+    $query = applyDirectoryRoleFilter($query, $role);
+
+    if ($search !== '') {
+        $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $search) . '%';
+
+        $query->where(function ($q) use ($like, $search) {
+            $q->where('name', 'like', $like)
+              ->orWhere('email', 'like', $like);
+
+            if (ctype_digit($search)) {
+                $q->orWhere('id', (int) $search);
+            }
+        });
+    }
+
+    $users = $query
+        ->orderBy('name', 'asc')
+        ->orderBy('id', 'asc')
+        ->limit($limit)
+        ->get(['id', 'name', 'email', 'role', 'account_type']);
+
+    return response()->json([
+        'message' => 'Fetched users.',
+        'users' => $users,
+    ]);
+}
+
+Route::middleware('auth')->get('students', function (Request $request) {
+    return directoryResponse($request, 'student');
+});
+
+Route::middleware('auth')->get('guests', function (Request $request) {
+    return directoryResponse($request, 'guest');
+});
+
+Route::middleware('auth')->get('counselors', function (Request $request) {
+    return directoryResponse($request, 'counselor');
+});
+
+Route::middleware('auth')->get('admins', function (Request $request) {
+    return directoryResponse($request, 'admin');
+});
+
+/**
+ * Generic endpoint used by the frontend fallback:
+ * GET /users?role=student|guest|counselor|admin
+ */
+Route::middleware('auth')->get('users', function (Request $request) {
+    $role = (string) $request->query('role', '');
+    $role = trim($role);
+
+    if ($role === '') {
+        return response()->json([
+            'message' => 'role query param is required.',
+        ], 422);
+    }
+
+    return directoryResponse($request, $role);
 });
 
 /*

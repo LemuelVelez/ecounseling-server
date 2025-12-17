@@ -13,13 +13,33 @@ return [
     |
     */
 
-    // Enable CORS on the routes your SPA actually calls.
+    // ✅ Enable CORS on ALL routes your SPA may call (including “directory” endpoints).
     'paths' => [
-        'auth/*',              // /auth/login, /auth/register, /auth/logout, /auth/me
-        'student/*',           // /student/intake and other student endpoints
-        'counselor/*',         // ✅ counselor endpoints
-        'admin/*',             // /admin/users, /admin/roles, etc.
-        'sanctum/csrf-cookie', // if you later use Sanctum
+        'auth/*',
+
+        // message APIs
+        'student/*',
+        'counselor/*',
+        'admin/*',
+
+        // ✅ directory/list endpoints your frontend is calling
+        'users',
+        'users/*',
+
+        'students',
+        'students/*',
+
+        'counselors',
+        'counselors/*',
+
+        'guests',
+        'guests/*',
+
+        // ✅ NEW: admins directory/list endpoints (fix CORS for /admins)
+        'admins',
+        'admins/*',
+
+        'sanctum/csrf-cookie',
     ],
 
     'allowed_methods' => ['*'],
