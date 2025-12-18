@@ -14,7 +14,11 @@ class CounselorMessageController extends Controller
     {
         if (! $user) return false;
         $role = strtolower((string) ($user->role ?? ''));
-        return str_contains($role, 'counselor') || str_contains($role, 'counsellor');
+
+        // ✅ also allow "guidance" role variants
+        return str_contains($role, 'counselor')
+            || str_contains($role, 'counsellor')
+            || str_contains($role, 'guidance');
     }
 
     private function conversationIdFor(
@@ -33,6 +37,11 @@ class CounselorMessageController extends Controller
             return "student-{$studentOwnerId}";
         }
 
+        // ✅ Admin direct thread
+        if ($recipientRole === 'admin' && $recipientId) {
+            return "admin-{$recipientId}";
+        }
+
         // Counselor-to-counselor direct thread
         if ($recipientRole === 'counselor' && $senderId && $recipientId) {
             $a = min($senderId, $recipientId);
@@ -48,12 +57,98 @@ class CounselorMessageController extends Controller
         return "general";
     }
 
+    private function looksLikeFilePath(string $s): bool
+    {
+        return (bool) (
+            preg_match('/\.[a-z0-9]{2,5}(\?.*)?$/i', $s) ||
+            preg_match('#(^|/)(avatars|avatar|profile|profiles|images|uploads)(/|$)#i', $s)
+        );
+    }
+
+    private function unparseUrl(array $parts): string
+    {
+        $scheme   = isset($parts['scheme']) ? $parts['scheme'] . '://' : '';
+        $user     = $parts['user'] ?? '';
+        $pass     = isset($parts['pass']) ? ':' . $parts['pass'] : '';
+        $auth     = $user !== '' ? $user . $pass . '@' : '';
+        $host     = $parts['host'] ?? '';
+        $port     = isset($parts['port']) ? ':' . $parts['port'] : '';
+        $path     = $parts['path'] ?? '';
+        $query    = isset($parts['query']) ? '?' . $parts['query'] : '';
+        $fragment = isset($parts['fragment']) ? '#' . $parts['fragment'] : '';
+
+        return $scheme . $auth . $host . $port . $path . $query . $fragment;
+    }
+
+    /**
+     * ✅ Normalize avatar_url into a usable absolute URL for the React app.
+     * Mirrors the behavior you already rely on in directory endpoints + frontend resolver:
+     * - keep data:/blob: as-is
+     * - keep absolute http(s) as-is BUT rewrite wrong /api/storage -> /storage
+     * - normalize common Laravel storage prefixes
+     * - ensure returned value is absolute via url("/storage/..")
+     */
+    private function resolveAvatarUrl(?string $raw): ?string
+    {
+        if ($raw == null) return null;
+
+        $s = trim((string) $raw);
+        if ($s === '') return null;
+
+        $s = str_replace('\\', '/', $s);
+
+        if (preg_match('#^(data:|blob:)#i', $s)) return $s;
+
+        // Absolute URL
+        if (preg_match('#^https?://#i', $s)) {
+            $parts = parse_url($s);
+            if (! is_array($parts)) return $s;
+
+            $path = isset($parts['path']) ? str_replace('\\', '/', (string) $parts['path']) : '';
+
+            // normalize common wrong absolute paths
+            $path = preg_replace('#^/api/storage/#i', '/storage/', $path);
+            $path = preg_replace('#^/api/public/storage/#i', '/storage/', $path);
+            $path = preg_replace('#^/storage/app/public/#i', '/storage/', $path);
+
+            $parts['path'] = $path;
+
+            return $this->unparseUrl($parts);
+        }
+
+        // Scheme-relative URL
+        if (str_starts_with($s, '//')) {
+            return request()->getScheme() . ':' . $s;
+        }
+
+        // Strip common Laravel prefixes
+        $s = preg_replace('#^storage/app/public/#i', '', $s);
+        $s = preg_replace('#^public/#i', '', $s);
+
+        $normalized = ltrim($s, '/');
+
+        $lower = strtolower($normalized);
+        $alreadyStorage = str_starts_with($lower, 'storage/')
+            || str_starts_with($lower, 'api/storage/');
+
+        if (! $alreadyStorage && $this->looksLikeFilePath($normalized)) {
+            $normalized = 'storage/' . $normalized;
+        }
+
+        // normalize relative api/storage/* => storage/*
+        $normalized = preg_replace('#^api/storage/#i', 'storage', $normalized);
+
+        $finalPath = '/' . ltrim($normalized, '/');
+
+        return url($finalPath);
+    }
+
     /**
      * GET /counselor/messages
      *
-     * IMPORTANT FIX:
-     * - Exclude conversations deleted by THIS counselor (persistently) using message_conversation_deletions.
-     * - If new messages arrive after deletion, they will show again (only newer than deleted_at).
+     * ✅ FIX:
+     * - Include sender/recipient avatars so Messages UI can render peerAvatarUrl.
+     * - For student/guest messages that may not have sender_id, fall back to messages.user_id's avatar.
      *
      * Read flag behavior:
      * - For counselor context, we alias counselor_is_read as is_read in the response.
@@ -74,6 +169,11 @@ class CounselorMessageController extends Controller
         $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
 
         $messages = Message::query()
+            // ✅ Join users for avatar lookup
+            ->leftJoin('users as sender_u', 'messages.sender_id', '=', 'sender_u.id')
+            ->leftJoin('users as recipient_u', 'messages.recipient_id', '=', 'recipient_u.id')
+            ->leftJoin('users as owner_u', 'messages.user_id', '=', 'owner_u.id')
+
             ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($user, $effectiveConversationIdSql) {
                 $join->on(DB::raw($effectiveConversationIdSql), '=', 'mcd.conversation_id')
                     ->where('mcd.user_id', '=', (int) $user->id);
@@ -88,7 +188,7 @@ class CounselorMessageController extends Controller
                         });
                 })
 
-                // 2) All student threads (full conversation history, regardless of which counselor sent replies)
+                // 2) All student threads (full conversation history)
                 ->orWhere(function ($q2) {
                     $q2->whereNotNull('messages.conversation_id')
                         ->where('messages.conversation_id', 'like', 'student-%');
@@ -121,7 +221,20 @@ class CounselorMessageController extends Controller
             ])
             ->selectRaw($effectiveConversationIdSql . ' as conversation_id')
             ->selectRaw('messages.counselor_is_read as is_read')
+
+            // ✅ Avatar fields for frontend (peerAvatarUrl)
+            ->selectRaw("COALESCE(sender_u.avatar_url, owner_u.avatar_url) as sender_avatar_url")
+            ->selectRaw("recipient_u.avatar_url as recipient_avatar_url")
+            ->selectRaw("owner_u.avatar_url as user_avatar_url")
             ->get();
+
+        // ✅ Normalize avatar URLs to usable absolute URLs
+        $messages->transform(function ($m) {
+            $m->sender_avatar_url = $this->resolveAvatarUrl($m->sender_avatar_url ?? null);
+            $m->recipient_avatar_url = $this->resolveAvatarUrl($m->recipient_avatar_url ?? null);
+            $m->user_avatar_url = $this->resolveAvatarUrl($m->user_avatar_url ?? null);
+            return $m;
+        });
 
         return response()->json([
             'message'  => 'Fetched counselor messages.',
@@ -146,7 +259,8 @@ class CounselorMessageController extends Controller
 
         $data = $request->validate([
             'content' => ['required', 'string'],
-            'recipient_role' => ['nullable', 'in:student,guest,counselor'],
+            // ✅ allow admin
+            'recipient_role' => ['nullable', 'in:student,guest,counselor,admin'],
             'recipient_id' => ['nullable', 'integer', 'exists:users,id'],
 
             // Accept string OR integer conversation ids from the frontend
@@ -171,11 +285,13 @@ class CounselorMessageController extends Controller
         // Enforce recipient requirements
         if ($recipientRole !== 'counselor' && ! $recipientId) {
             return response()->json([
-                'message' => 'recipient_id is required for student/guest recipients.',
+                'message' => 'recipient_id is required for student/guest/admin recipients.',
             ], 422);
         }
 
-        // If sending to a specific user, ensure their role matches expected (student/guest/counselor)
+        $recipientUser = null;
+
+        // If sending to a specific user, ensure their role matches expected
         if ($recipientId) {
             $recipientUser = User::find($recipientId);
             if (! $recipientUser) {
@@ -192,12 +308,18 @@ class CounselorMessageController extends Controller
                 return response()->json(['message' => 'Recipient is not a guest.'], 422);
             }
 
-            if ($recipientRole === 'counselor' && ! (str_contains($targetRole, 'counselor') || str_contains($targetRole, 'counsellor'))) {
+            if ($recipientRole === 'counselor'
+                && ! (str_contains($targetRole, 'counselor') || str_contains($targetRole, 'counsellor') || str_contains($targetRole, 'guidance'))
+            ) {
                 return response()->json(['message' => 'Recipient is not a counselor.'], 422);
+            }
+
+            if ($recipientRole === 'admin' && ! str_contains($targetRole, 'admin')) {
+                return response()->json(['message' => 'Recipient is not an admin.'], 422);
             }
         }
 
-        // Canonical conversation id (keeps student threads stable and counselor threads deterministic)
+        // Canonical conversation id
         $canonicalConversationId = $this->conversationIdFor(
             'counselor',
             (int) $user->id,
@@ -206,7 +328,6 @@ class CounselorMessageController extends Controller
             null
         );
 
-        // Use the canonical id; only accept the provided hint if it exactly matches.
         $conversationHint = $data['conversation_id'] ?? null;
         $conversationId = ((string) $conversationHint === $canonicalConversationId)
             ? $canonicalConversationId
@@ -224,14 +345,13 @@ class CounselorMessageController extends Controller
         $message->content = $data['content'];
 
         // Preserve legacy "user_id" meaning:
-        // - if sending to student/guest => user_id = recipient (so /student/messages can query by user_id)
-        // - otherwise => set to counselor sender (keeps non-null constraints)
+        // - if sending to student/guest => user_id = recipient
+        // - otherwise => set to counselor sender
         $message->user_id = $recipientId && in_array($recipientRole, ['student', 'guest'], true)
             ? $recipientId
             : (int) $user->id;
 
         // Read flags:
-        // Student read flag (is_read) only matters for student/guest recipients
         if (in_array($recipientRole, ['student', 'guest'], true)) {
             $message->is_read = false;
             $message->student_read_at = null;
@@ -240,7 +360,6 @@ class CounselorMessageController extends Controller
             $message->student_read_at = now();
         }
 
-        // Counselor read flag matters when counselor is recipient
         if ($recipientRole === 'counselor') {
             $message->counselor_is_read = false;
             $message->counselor_read_at = null;
@@ -251,7 +370,10 @@ class CounselorMessageController extends Controller
 
         $message->save();
 
-        // IMPORTANT: return counselor_is_read as is_read for counselor context
+        // ✅ include avatar URLs in response so UI updates immediately
+        $senderAvatar = $this->resolveAvatarUrl($user->avatar_url ?? null);
+        $recipientAvatar = $this->resolveAvatarUrl($recipientUser?->avatar_url ?? null);
+
         $responseRecord = [
             'id' => $message->id,
             'user_id' => $message->user_id,
@@ -265,6 +387,10 @@ class CounselorMessageController extends Controller
             'is_read' => (bool) $message->counselor_is_read,
             'created_at' => $message->created_at,
             'updated_at' => $message->updated_at,
+
+            // ✅ new fields used by frontend avatar picker
+            'sender_avatar_url' => $senderAvatar,
+            'recipient_avatar_url' => $recipientAvatar,
         ];
 
         return response()->json([
