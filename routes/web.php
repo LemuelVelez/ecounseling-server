@@ -11,10 +11,54 @@ use App\Http\Controllers\Admin\AdminUserController;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Storage;
 
 Route::get('/', function () {
     return view('welcome');
 });
+
+/*
+|--------------------------------------------------------------------------
+| ✅ FIX: Serve public storage files (avatars) reliably
+|--------------------------------------------------------------------------
+| If the storage symlink is missing in some environments, /storage/* will 404.
+| This route serves files from the "public" disk (storage/app/public).
+|
+| Frontend AvatarImage typically uses:
+|   /storage/avatars/xxx.jpg
+*/
+Route::get('storage/{path}', function (Request $request, string $path) {
+    $path = str_replace('\\', '/', $path);
+    $path = ltrim($path, '/');
+
+    // basic traversal guard
+    if ($path === '' || str_contains($path, '..')) {
+        abort(404);
+    }
+
+    $disk = Storage::disk('public');
+
+    if (! $disk->exists($path)) {
+        abort(404);
+    }
+
+    $stream = $disk->readStream($path);
+    if (! $stream) {
+        abort(404);
+    }
+
+    $mime = $disk->mimeType($path) ?: 'application/octet-stream';
+
+    return response()->stream(function () use ($stream) {
+        fpassthru($stream);
+        if (is_resource($stream)) {
+            fclose($stream);
+        }
+    }, 200, [
+        'Content-Type'  => $mime,
+        'Cache-Control' => 'public, max-age=31536000, immutable',
+    ]);
+})->where('path', '.*')->name('storage.public');
 
 /*
 |--------------------------------------------------------------------------
@@ -165,13 +209,41 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
     Route::post('messages/mark-as-read', [CounselorMessageController::class, 'markAsRead'])
         ->name('counselor.messages.markAsRead');
+
+    /*
+    |----------------------------------------------------------------------
+    | ✅ FIX: Counselor directory aliases to stop 404s from the React app
+    |----------------------------------------------------------------------
+    */
+    Route::get('students', function (Request $request) {
+        return directoryResponse($request, 'student');
+    })->name('counselor.directory.students');
+
+    Route::get('guests', function (Request $request) {
+        return directoryResponse($request, 'guest');
+    })->name('counselor.directory.guests');
+
+    Route::get('users', function (Request $request) {
+        $roles = directoryNormalizeRolesFromRequest($request);
+
+        if (count($roles) === 0) {
+            return response()->json([
+                'message' => 'role or roles query param is required.',
+            ], 422);
+        }
+
+        if (count($roles) === 1) {
+            return directoryResponse($request, $roles[0]);
+        }
+
+        return directoryResponseMulti($request, $roles);
+    })->name('counselor.directory.users');
 });
 
 /*
 |--------------------------------------------------------------------------
 | ✅ Directory endpoints
 |--------------------------------------------------------------------------
-| (unchanged below)
 */
 
 function directoryCanListUsers(?User $actor, string $targetRole): bool
@@ -222,6 +294,179 @@ function applyDirectoryRoleFilter($query, string $role)
     return $query->whereRaw('1 = 0');
 }
 
+function directoryLooksLikeFilePath(string $s): bool
+{
+    return (bool) (
+        preg_match('/\.[a-z0-9]{2,5}(\?.*)?$/i', $s) ||
+        preg_match('#(^|/)(avatars|avatar|profile|profiles|images|uploads)(/|$)#i', $s)
+    );
+}
+
+/*
+|----------------------------------------------------------------------
+| ✅ FIX: Normalize avatar_url to an absolute URL for the React app
+|----------------------------------------------------------------------
+| messages.tsx doesn’t have a resolveAvatarSrc helper like users.tsx,
+| so directory endpoints should return a usable absolute avatar_url.
+*/
+function directoryResolveAvatarUrl(?string $raw): ?string
+{
+    if ($raw == null) return null;
+
+    $s = trim((string) $raw);
+    if ($s === '') return null;
+
+    $s = str_replace('\\', '/', $s);
+
+    if (preg_match('#^(data:|blob:)#i', $s)) return $s;
+    if (preg_match('#^https?://#i', $s)) return $s;
+    if (str_starts_with($s, '//')) {
+        return request()->getScheme() . ':' . $s;
+    }
+
+    // Strip common Laravel prefixes
+    $s = preg_replace('#^storage/app/public/#i', '', $s);
+    $s = preg_replace('#^public/#i', '', $s);
+
+    $normalized = ltrim($s, '/');
+
+    $lower = strtolower($normalized);
+    $alreadyStorage = str_starts_with($lower, 'storage/')
+        || str_starts_with($lower, 'api/storage/');
+
+    if (! $alreadyStorage && directoryLooksLikeFilePath($normalized)) {
+        $normalized = 'storage/' . $normalized;
+    }
+
+    $finalPath = '/' . ltrim($normalized, '/');
+
+    // url() builds an absolute URL based on the current request host/scheme
+    return url($finalPath);
+}
+
+/**
+ * ✅ FIX: Accept both role=student and roles=student,guest (or roles[]=student&roles[]=guest)
+ * and normalize plural forms.
+ */
+function directoryNormalizeRolesFromRequest(Request $request): array
+{
+    $rolesParam = $request->query('roles', null);
+    $roleParam  = $request->query('role', null);
+
+    $roles = [];
+
+    if (is_array($rolesParam)) {
+        $roles = $rolesParam;
+    } elseif (is_string($rolesParam) && trim($rolesParam) !== '') {
+        $roles = preg_split('/\s*,\s*/', trim($rolesParam), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    } elseif (is_string($roleParam) && trim($roleParam) !== '') {
+        $roles = [trim($roleParam)];
+    }
+
+    $map = [
+        'students'    => 'student',
+        'guests'      => 'guest',
+        'counselors'  => 'counselor',
+        'counsellors' => 'counselor',
+        'guidance'    => 'counselor',
+        'admins'      => 'admin',
+    ];
+
+    $allowed = ['student', 'guest', 'counselor', 'admin'];
+
+    $norm = [];
+    foreach ($roles as $r) {
+        $rr = strtolower(trim((string) $r));
+        if ($rr === '') continue;
+        if (isset($map[$rr])) $rr = $map[$rr];
+        if (! in_array($rr, $allowed, true)) continue;
+        $norm[] = $rr;
+    }
+
+    return array_values(array_unique($norm));
+}
+
+/**
+ * ✅ FIX: Multi-role directory response (e.g. roles=student,guest)
+ */
+function directoryResponseMulti(Request $request, array $roles)
+{
+    $actor = $request->user();
+
+    if (! $actor) {
+        return response()->json(['message' => 'Unauthenticated.'], 401);
+    }
+
+    foreach ($roles as $role) {
+        if (! directoryCanListUsers($actor, $role)) {
+            return response()->json(['message' => 'Forbidden.'], 403);
+        }
+    }
+
+    $limitRaw = $request->query('limit', $request->query('per_page', 20));
+    $limit = (int) $limitRaw;
+    if ($limit < 1) $limit = 20;
+    if ($limit > 100) $limit = 100;
+
+    $search = (string) ($request->query('search', $request->query('q', $request->query('query', ''))));
+    $search = trim($search);
+
+    $query = User::query();
+
+    $query->where(function ($or) use ($roles) {
+        foreach ($roles as $role) {
+            $or->orWhere(function ($sub) use ($role) {
+                applyDirectoryRoleFilter($sub, $role);
+            });
+        }
+    });
+
+    if ($search !== '') {
+        $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $search) . '%';
+
+        $query->where(function ($q) use ($like, $search) {
+            $q->where('name', 'like', $like)
+              ->orWhere('email', 'like', $like);
+
+            if (ctype_digit($search)) {
+                $q->orWhere('id', (int) $search);
+            }
+        });
+    }
+
+    $users = $query
+        ->orderBy('name', 'asc')
+        ->orderBy('id', 'asc')
+        ->limit($limit)
+        ->get([
+            'id',
+            'name',
+            'email',
+            'role',
+            'account_type',
+
+            // ✅ include avatar + student metadata for counselor UI + messages UI
+            'avatar_url',
+            'student_id',
+            'year_level',
+            'program',
+            'course',
+            'gender',
+            'created_at',
+        ]);
+
+    // ✅ Ensure avatar_url is an absolute URL usable by the frontend
+    $users->transform(function ($u) {
+        $u->avatar_url = directoryResolveAvatarUrl($u->avatar_url);
+        return $u;
+    });
+
+    return response()->json([
+        'message' => 'Fetched users.',
+        'users'   => $users,
+    ]);
+}
+
 function directoryResponse(Request $request, string $role)
 {
     $actor = $request->user();
@@ -262,11 +507,32 @@ function directoryResponse(Request $request, string $role)
         ->orderBy('name', 'asc')
         ->orderBy('id', 'asc')
         ->limit($limit)
-        ->get(['id', 'name', 'email', 'role', 'account_type']);
+        ->get([
+            'id',
+            'name',
+            'email',
+            'role',
+            'account_type',
+
+            // ✅ include avatar + student metadata for counselor UI + messages UI
+            'avatar_url',
+            'student_id',
+            'year_level',
+            'program',
+            'course',
+            'gender',
+            'created_at',
+        ]);
+
+    // ✅ Ensure avatar_url is an absolute URL usable by the frontend
+    $users->transform(function ($u) {
+        $u->avatar_url = directoryResolveAvatarUrl($u->avatar_url);
+        return $u;
+    });
 
     return response()->json([
         'message' => 'Fetched users.',
-        'users' => $users,
+        'users'   => $users,
     ]);
 }
 
@@ -287,16 +553,19 @@ Route::middleware('auth')->get('admins', function (Request $request) {
 });
 
 Route::middleware('auth')->get('users', function (Request $request) {
-    $role = (string) $request->query('role', '');
-    $role = trim($role);
+    $roles = directoryNormalizeRolesFromRequest($request);
 
-    if ($role === '') {
+    if (count($roles) === 0) {
         return response()->json([
-            'message' => 'role query param is required.',
+            'message' => 'role or roles query param is required.',
         ], 422);
     }
 
-    return directoryResponse($request, $role);
+    if (count($roles) === 1) {
+        return directoryResponse($request, $roles[0]);
+    }
+
+    return directoryResponseMulti($request, $roles);
 });
 
 /*
