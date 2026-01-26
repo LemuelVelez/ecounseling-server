@@ -12,6 +12,9 @@ class IntakeRequest extends Model
     protected $fillable = [
         'user_id',
 
+        // ✅ NEW: counselor assignment
+        'counselor_id',
+
         // Core scheduling + status
         'concern_type',
         'urgency',
@@ -54,5 +57,13 @@ class IntakeRequest extends Model
     public function user()
     {
         return $this->belongsTo(User::class);
+    }
+
+    /**
+     * ✅ NEW: assigned counselor
+     */
+    public function counselor()
+    {
+        return $this->belongsTo(User::class, 'counselor_id');
     }
 }

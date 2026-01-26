@@ -8,6 +8,14 @@ use App\Http\Controllers\MessageConversationController;
 use App\Http\Controllers\StudentProfileController;
 use App\Http\Controllers\Admin\AdminRoleController;
 use App\Http\Controllers\Admin\AdminUserController;
+
+// ✅ NEW controllers
+use App\Http\Controllers\AnalyticsController;
+use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\ReferralController;
+use App\Http\Controllers\ManualAssessmentScoreController;
+use App\Http\Controllers\CounselorStudentController;
+
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -84,6 +92,17 @@ Route::prefix('auth')->group(function () {
     Route::post('password/reset', [AuthController::class, 'resetPassword'])
         ->name('auth.password.reset');
 });
+
+/*
+|--------------------------------------------------------------------------
+| ✅ NEW: Notification counts endpoint (badges)
+|--------------------------------------------------------------------------
+| unread messages count
+| pending appointments count (counselor)
+| new referrals count (counselor + referral users)
+*/
+Route::middleware('auth')->get('notifications/counts', [NotificationController::class, 'counts'])
+    ->name('notifications.counts');
 
 /*
 |--------------------------------------------------------------------------
@@ -212,6 +231,57 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
     /*
     |----------------------------------------------------------------------
+    | ✅ NEW: Analytics endpoint
+    |----------------------------------------------------------------------
+    */
+    Route::get('analytics', [AnalyticsController::class, 'summary'])
+        ->name('counselor.analytics.summary');
+
+    /*
+    |----------------------------------------------------------------------
+    | ✅ NEW: Referral module endpoints (counselor side)
+    |----------------------------------------------------------------------
+    */
+    Route::get('referrals', [ReferralController::class, 'counselorIndex'])
+        ->name('counselor.referrals.index');
+
+    Route::get('referrals/{id}', [ReferralController::class, 'show'])
+        ->whereNumber('id')
+        ->name('counselor.referrals.show');
+
+    Route::patch('referrals/{id}', [ReferralController::class, 'update'])
+        ->whereNumber('id')
+        ->name('counselor.referrals.update');
+
+    /*
+    |----------------------------------------------------------------------
+    | ✅ NEW: Student profile + history (counselor view)
+    |----------------------------------------------------------------------
+    */
+    Route::get('students/{id}', [CounselorStudentController::class, 'show'])
+        ->whereNumber('id')
+        ->name('counselor.students.show');
+
+    Route::get('students/{id}/history', [CounselorStudentController::class, 'history'])
+        ->whereNumber('id')
+        ->name('counselor.students.history');
+
+    /*
+    |----------------------------------------------------------------------
+    | ✅ NEW: Hardcopy assessment score encoding
+    |----------------------------------------------------------------------
+    */
+    Route::get('case-load', [ManualAssessmentScoreController::class, 'caseLoad'])
+        ->name('counselor.case_load.index');
+
+    Route::post('manual-scores', [ManualAssessmentScoreController::class, 'store'])
+        ->name('counselor.manual_scores.store');
+
+    Route::get('manual-scores', [ManualAssessmentScoreController::class, 'index'])
+        ->name('counselor.manual_scores.index');
+
+    /*
+    |----------------------------------------------------------------------
     | ✅ FIX: Counselor directory aliases to stop 404s from the React app
     |----------------------------------------------------------------------
     */
@@ -238,6 +308,24 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 
         return directoryResponseMulti($request, $roles);
     })->name('counselor.directory.users');
+});
+
+/*
+|--------------------------------------------------------------------------
+| ✅ NEW: Referral User endpoints (Dean/Registrar/Program Chair)
+|--------------------------------------------------------------------------
+| They can create referrals + view their own referral history.
+*/
+Route::middleware('auth')->prefix('referral-user')->group(function () {
+    Route::post('referrals', [ReferralController::class, 'store'])
+        ->name('referral_user.referrals.store');
+
+    Route::get('referrals', [ReferralController::class, 'referralUserIndex'])
+        ->name('referral_user.referrals.index');
+
+    Route::get('referrals/{id}', [ReferralController::class, 'show'])
+        ->whereNumber('id')
+        ->name('referral_user.referrals.show');
 });
 
 /*
@@ -290,7 +378,6 @@ function applyDirectoryRoleFilter($query, string $role)
         return $query->whereRaw('LOWER(role) LIKE ?', ['%admin%']);
     }
 
-    // Unknown role => return none (safer than returning everyone)
     return $query->whereRaw('1 = 0');
 }
 
@@ -302,13 +389,6 @@ function directoryLooksLikeFilePath(string $s): bool
     );
 }
 
-/*
-|----------------------------------------------------------------------
-| ✅ FIX: Normalize avatar_url to an absolute URL for the React app
-|----------------------------------------------------------------------
-| messages.tsx doesn’t have a resolveAvatarSrc helper like users.tsx,
-| so directory endpoints should return a usable absolute avatar_url.
-*/
 function directoryResolveAvatarUrl(?string $raw): ?string
 {
     if ($raw == null) return null;
@@ -324,7 +404,6 @@ function directoryResolveAvatarUrl(?string $raw): ?string
         return request()->getScheme() . ':' . $s;
     }
 
-    // Strip common Laravel prefixes
     $s = preg_replace('#^storage/app/public/#i', '', $s);
     $s = preg_replace('#^public/#i', '', $s);
 
@@ -340,14 +419,9 @@ function directoryResolveAvatarUrl(?string $raw): ?string
 
     $finalPath = '/' . ltrim($normalized, '/');
 
-    // url() builds an absolute URL based on the current request host/scheme
     return url($finalPath);
 }
 
-/**
- * ✅ FIX: Accept both role=student and roles=student,guest (or roles[]=student&roles[]=guest)
- * and normalize plural forms.
- */
 function directoryNormalizeRolesFromRequest(Request $request): array
 {
     $rolesParam = $request->query('roles', null);
@@ -386,9 +460,6 @@ function directoryNormalizeRolesFromRequest(Request $request): array
     return array_values(array_unique($norm));
 }
 
-/**
- * ✅ FIX: Multi-role directory response (e.g. roles=student,guest)
- */
 function directoryResponseMulti(Request $request, array $roles)
 {
     $actor = $request->user();
@@ -444,8 +515,6 @@ function directoryResponseMulti(Request $request, array $roles)
             'email',
             'role',
             'account_type',
-
-            // ✅ include avatar + student metadata for counselor UI + messages UI
             'avatar_url',
             'student_id',
             'year_level',
@@ -455,7 +524,6 @@ function directoryResponseMulti(Request $request, array $roles)
             'created_at',
         ]);
 
-    // ✅ Ensure avatar_url is an absolute URL usable by the frontend
     $users->transform(function ($u) {
         $u->avatar_url = directoryResolveAvatarUrl($u->avatar_url);
         return $u;
@@ -513,8 +581,6 @@ function directoryResponse(Request $request, string $role)
             'email',
             'role',
             'account_type',
-
-            // ✅ include avatar + student metadata for counselor UI + messages UI
             'avatar_url',
             'student_id',
             'year_level',
@@ -524,7 +590,6 @@ function directoryResponse(Request $request, string $role)
             'created_at',
         ]);
 
-    // ✅ Ensure avatar_url is an absolute URL usable by the frontend
     $users->transform(function ($u) {
         $u->avatar_url = directoryResolveAvatarUrl($u->avatar_url);
         return $u;

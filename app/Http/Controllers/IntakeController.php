@@ -29,6 +29,10 @@ class IntakeController extends Controller
 
         $intake = new IntakeRequest();
         $intake->user_id        = $user->id;
+
+        // ✅ NEW: counselor assignment starts empty
+        $intake->counselor_id   = null;
+
         $intake->concern_type   = $data['concern_type'];
         $intake->urgency        = $data['urgency'];
 
@@ -151,10 +155,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * ✅ FIX: /student/assessments/{id} (prevents 404 when frontend hits this URL)
-     * ✅ NEW: supports DELETE /student/assessments/{id} and DELETE /student/intake/assessments/{id}
-     */
     public function studentAssessment(Request $request, $id): JsonResponse
     {
         $user = $request->user();
@@ -167,7 +167,6 @@ class IntakeController extends Controller
 
         $method = strtoupper($request->method());
 
-        // ✅ DELETE: student deletes their own assessment
         if ($method === 'DELETE') {
             $assessment = IntakeAssessment::query()->find($id);
 
@@ -190,10 +189,8 @@ class IntakeController extends Controller
             ]);
         }
 
-        // GET: Try primary key first
         $assessment = IntakeAssessment::query()->find($id);
 
-        // Fallback: if client passed the user's id, return latest assessment for that student
         if (! $assessment && (string) $id === (string) $user->id) {
             $assessment = IntakeAssessment::query()
                 ->where('user_id', $user->id)
@@ -218,10 +215,6 @@ class IntakeController extends Controller
         ]);
     }
 
-    /**
-     * ✅ FIX: /student/appointments/{id} GET (prevents 405 when frontend tries to load a single item)
-     * ✅ NEW: supports DELETE /student/appointments/{id} (used by student Evaluation page delete button)
-     */
     public function studentAppointment(Request $request, $id): JsonResponse
     {
         $user = $request->user();
@@ -234,7 +227,6 @@ class IntakeController extends Controller
 
         $method = strtoupper($request->method());
 
-        // ✅ DELETE: student deletes their own appointment/request
         if ($method === 'DELETE') {
             $appointment = IntakeRequest::query()->find($id);
 
@@ -257,10 +249,8 @@ class IntakeController extends Controller
             ]);
         }
 
-        // GET: normal lookup
         $appointment = IntakeRequest::query()->find($id);
 
-        // Optional fallback: if client passed user's id, return latest appointment for that student
         if (! $appointment && (string) $id === (string) $user->id) {
             $appointment = IntakeRequest::query()
                 ->where('user_id', $user->id)
@@ -281,7 +271,6 @@ class IntakeController extends Controller
         }
 
         return response()->json([
-            // keep key name consistent with other student update responses
             'appointment' => $appointment,
         ]);
     }
@@ -322,6 +311,9 @@ class IntakeController extends Controller
         ]);
     }
 
+    /**
+     * ✅ UPDATED: pagination for counselor requests (10 per page default)
+     */
     public function counselorRequests(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -332,15 +324,25 @@ class IntakeController extends Controller
             ], 401);
         }
 
+        $perPage = (int) ($request->query('per_page', 10));
+        if ($perPage < 1) $perPage = 10;
+        if ($perPage > 100) $perPage = 100;
+
         $requests = IntakeRequest::query()
             ->with(['user' => function ($q) {
-                $q->select('id', 'name', 'email');
+                $q->select('id', 'name', 'email', 'avatar_url', 'student_id', 'year_level', 'program', 'course');
             }])
             ->orderBy('created_at', 'desc')
-            ->get();
+            ->paginate($perPage);
 
         return response()->json([
-            'requests' => $requests,
+            'requests' => $requests->items(),
+            'meta' => [
+                'current_page' => $requests->currentPage(),
+                'per_page' => $requests->perPage(),
+                'total' => $requests->total(),
+                'last_page' => $requests->lastPage(),
+            ],
         ]);
     }
 
@@ -385,7 +387,6 @@ class IntakeController extends Controller
 
         $assessment = IntakeAssessment::query()->find($id);
 
-        // Fallback: treat {id} as user_id and return latest assessment for that user.
         if (! $assessment) {
             $assessment = IntakeAssessment::query()
                 ->where('user_id', $id)
@@ -446,6 +447,9 @@ class IntakeController extends Controller
         ]);
     }
 
+    /**
+     * ✅ UPDATED: Assign counselor_id when counselor schedules / updates appointment
+     */
     public function counselorUpdateAppointment(Request $request, IntakeRequest $intake): JsonResponse
     {
         $user = $request->user();
@@ -485,6 +489,9 @@ class IntakeController extends Controller
             $intake->scheduled_date = $incomingDate;
             $intake->scheduled_time = $incomingTime;
 
+            // ✅ assign current counselor
+            $intake->counselor_id = (int) $user->id;
+
             if (empty($data['status'])) {
                 $intake->status = 'scheduled';
             }
@@ -496,6 +503,11 @@ class IntakeController extends Controller
                 $status = 'cancelled';
             }
             $intake->status = $status;
+
+            // ✅ assign current counselor even if only status changed
+            if ($intake->counselor_id === null) {
+                $intake->counselor_id = (int) $user->id;
+            }
         }
 
         $intake->save();
