@@ -5,6 +5,7 @@ use App\Http\Controllers\IntakeController;
 use App\Http\Controllers\StudentMessageController;
 use App\Http\Controllers\CounselorMessageController;
 use App\Http\Controllers\MessageConversationController;
+use App\Http\Controllers\MessageController;
 use App\Http\Controllers\StudentProfileController;
 use App\Http\Controllers\Admin\AdminRoleController;
 use App\Http\Controllers\Admin\AdminUserController;
@@ -103,6 +104,23 @@ Route::prefix('auth')->group(function () {
 */
 Route::middleware('auth')->get('notifications/counts', [NotificationController::class, 'counts'])
     ->name('notifications.counts');
+
+/*
+|--------------------------------------------------------------------------
+| ✅ FIX: Message update/delete endpoints (for editing messages)
+|--------------------------------------------------------------------------
+| Frontend calls:
+| - PATCH /messages/{id}
+| - PUT   /messages/{id}
+| - DELETE /messages/{id}
+*/
+Route::middleware('auth')->match(['PATCH', 'PUT'], 'messages/{id}', [MessageController::class, 'update'])
+    ->whereNumber('id')
+    ->name('messages.update');
+
+Route::middleware('auth')->delete('messages/{id}', [MessageController::class, 'destroy'])
+    ->whereNumber('id')
+    ->name('messages.destroy');
 
 /*
 |--------------------------------------------------------------------------

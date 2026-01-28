@@ -18,6 +18,10 @@ return [
         'counselor/*',
         'admin/*',
 
+        // ✅ FIX: notifications endpoint (badges)
+        'notifications',
+        'notifications/*',
+
         // ✅ conversation/thread delete endpoints used by the frontend
         'messages',
         'messages/*',

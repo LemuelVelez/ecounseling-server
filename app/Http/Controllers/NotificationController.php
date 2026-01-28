@@ -36,12 +36,31 @@ class NotificationController extends Controller
     }
 
     /**
+     * Make this endpoint resilient:
+     * If a table/model is not migrated yet, do not 500 the whole endpoint.
+     */
+    private function safeCount(callable $fn): int
+    {
+        try {
+            $v = $fn();
+            return is_numeric($v) ? (int) $v : 0;
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
      * GET /notifications/counts
      *
      * Returns notification badges:
      * - unread_messages
      * - pending_appointments (counselor)
      * - new_referrals (counselor + referral users)
+     *
+     * ✅ IMPORTANT:
+     * We expose counts both:
+     * - as top-level keys (what your frontend expects)
+     * - and inside "counts" (backward compatibility)
      */
     public function counts(Request $request): JsonResponse
     {
@@ -56,38 +75,48 @@ class NotificationController extends Controller
         $newReferrals = 0;
 
         if ($this->isCounselor($user)) {
-            $unreadMessages = Message::query()
-                ->where('recipient_role', 'counselor')
-                ->where('counselor_is_read', false)
-                ->where(function ($q) use ($user) {
-                    $q->whereNull('recipient_id')
-                      ->orWhere('recipient_id', (int) $user->id);
-                })
-                ->count();
+            $unreadMessages = $this->safeCount(function () use ($user) {
+                return Message::query()
+                    ->where('recipient_role', 'counselor')
+                    ->where('counselor_is_read', false)
+                    ->where(function ($q) use ($user) {
+                        $q->whereNull('recipient_id')
+                          ->orWhere('recipient_id', (int) $user->id);
+                    })
+                    ->count();
+            });
 
-            $pendingAppointments = IntakeRequest::query()
-                ->where('status', 'pending')
-                ->count();
+            $pendingAppointments = $this->safeCount(function () {
+                return IntakeRequest::query()
+                    ->where('status', 'pending')
+                    ->count();
+            });
 
-            $newReferrals = Referral::query()
-                ->where('status', 'pending')
-                ->count();
+            $newReferrals = $this->safeCount(function () {
+                return Referral::query()
+                    ->where('status', 'pending')
+                    ->count();
+            });
         } elseif ($this->isReferralUser($user)) {
-            // Referral users: show how many of THEIR referrals are still pending
-            $newReferrals = Referral::query()
-                ->where('requested_by_id', (int) $user->id)
-                ->where('status', 'pending')
-                ->count();
+            // Referral users: how many of THEIR referrals are still pending
+            $newReferrals = $this->safeCount(function () use ($user) {
+                return Referral::query()
+                    ->where('requested_by_id', (int) $user->id)
+                    ->where('status', 'pending')
+                    ->count();
+            });
 
-            // Messaging module for referral users can be added later
+            // If you later implement referral-user messaging + read flags, update here.
             $unreadMessages = 0;
             $pendingAppointments = 0;
         } else {
             // Student/Guest: unread messages for their thread
-            $unreadMessages = Message::query()
-                ->where('user_id', (int) $user->id)
-                ->where('is_read', false)
-                ->count();
+            $unreadMessages = $this->safeCount(function () use ($user) {
+                return Message::query()
+                    ->where('user_id', (int) $user->id)
+                    ->where('is_read', false)
+                    ->count();
+            });
 
             $pendingAppointments = 0;
             $newReferrals = 0;
@@ -95,6 +124,13 @@ class NotificationController extends Controller
 
         return response()->json([
             'message' => 'Fetched notification counts.',
+
+            // ✅ top-level keys (frontend badge mapping)
+            'unread_messages' => $unreadMessages,
+            'pending_appointments' => $pendingAppointments,
+            'new_referrals' => $newReferrals,
+
+            // ✅ keep nested counts too (compat)
             'counts' => [
                 'unread_messages' => $unreadMessages,
                 'pending_appointments' => $pendingAppointments,
