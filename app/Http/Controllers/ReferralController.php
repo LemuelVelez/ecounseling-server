@@ -6,6 +6,8 @@ use App\Models\Referral;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 class ReferralController extends Controller
 {
@@ -32,10 +34,48 @@ class ReferralController extends Controller
     }
 
     /**
+     * Only select columns that actually exist in the users table to avoid SQL errors (500).
+     */
+    private function userSelectColumns(array $extras = []): array
+    {
+        $base = ['id', 'name', 'email', 'role'];
+
+        $wanted = array_values(array_unique(array_merge($base, $extras)));
+
+        $cols = [];
+        foreach ($wanted as $c) {
+            if (Schema::hasColumn('users', $c)) {
+                $cols[] = $c;
+            }
+        }
+
+        // Ensure id is present for relationship mapping.
+        if (! in_array('id', $cols, true)) {
+            array_unshift($cols, 'id');
+        }
+
+        return $cols;
+    }
+
+    private function referralWith(): array
+    {
+        // Student: include extra columns only if they exist.
+        $studentExtras = ['student_id', 'program', 'course', 'year_level'];
+        $studentCols = $this->userSelectColumns($studentExtras);
+
+        // RequestedBy/Counselor: keep minimal.
+        $miniCols = $this->userSelectColumns([]);
+
+        return [
+            'student:' . implode(',', $studentCols),
+            'requestedBy:' . implode(',', $miniCols),
+            'counselor:' . implode(',', $miniCols),
+        ];
+    }
+
+    /**
      * POST /referral-user/referrals
      * Create referral request (Dean/Registrar/Program Chair)
-     *
-     * ✅ Tracks "Requested By" automatically.
      */
     public function store(Request $request): JsonResponse
     {
@@ -56,7 +96,6 @@ class ReferralController extends Controller
             'details'      => ['required', 'string'],
         ]);
 
-        // Ensure student_id is really a student (role contains student)
         $student = User::find((int) $data['student_id']);
         if (! $student) {
             return response()->json(['message' => 'Student not found.'], 404);
@@ -81,10 +120,7 @@ class ReferralController extends Controller
 
         $ref->save();
 
-        $ref->load([
-            'student:id,name,email,role,student_id,program,course,year_level',
-            'requestedBy:id,name,email,role',
-        ]);
+        $ref->load($this->referralWith());
 
         return response()->json([
             'message'  => 'Referral submitted.',
@@ -103,38 +139,42 @@ class ReferralController extends Controller
         if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
         if (! $this->isCounselor($actor)) return response()->json(['message' => 'Forbidden.'], 403);
 
-        $perPage = (int) ($request->query('per_page', 10));
-        if ($perPage < 1) $perPage = 10;
-        if ($perPage > 100) $perPage = 100;
+        try {
+            $perPage = (int) ($request->query('per_page', 10));
+            if ($perPage < 1) $perPage = 10;
+            if ($perPage > 100) $perPage = 100;
 
-        $status = trim((string) $request->query('status', ''));
-        $status = $status !== '' ? strtolower($status) : null;
+            $status = trim((string) $request->query('status', ''));
+            $status = $status !== '' ? strtolower($status) : null;
 
-        $q = Referral::query()
-            ->with([
-                'student:id,name,email,role,student_id,program,course,year_level',
-                'requestedBy:id,name,email,role',
-                'counselor:id,name,email,role',
-            ])
-            ->orderByDesc('created_at')
-            ->orderByDesc('id');
+            $q = Referral::query()
+                ->with($this->referralWith())
+                ->orderByDesc('created_at')
+                ->orderByDesc('id');
 
-        if ($status) {
-            $q->where('status', $status);
+            if ($status) {
+                $q->where('status', $status);
+            }
+
+            $p = $q->paginate($perPage);
+
+            return response()->json([
+                'message' => 'Fetched referrals.',
+                'referrals' => $p->items(),
+                'meta' => [
+                    'current_page' => $p->currentPage(),
+                    'per_page' => $p->perPage(),
+                    'total' => $p->total(),
+                    'last_page' => $p->lastPage(),
+                ],
+            ]);
+        } catch (Throwable $e) {
+            // If APP_DEBUG=true you'll see the real issue in laravel.log.
+            return response()->json([
+                'message' => 'Failed to fetch referrals.',
+                'error' => $e->getMessage(),
+            ], 500);
         }
-
-        $p = $q->paginate($perPage);
-
-        return response()->json([
-            'message' => 'Fetched referrals.',
-            'referrals' => $p->items(),
-            'meta' => [
-                'current_page' => $p->currentPage(),
-                'per_page' => $p->perPage(),
-                'total' => $p->total(),
-                'last_page' => $p->lastPage(),
-            ],
-        ]);
     }
 
     /**
@@ -148,32 +188,35 @@ class ReferralController extends Controller
         if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
         if (! $this->isReferralUser($actor)) return response()->json(['message' => 'Forbidden.'], 403);
 
-        $perPage = (int) ($request->query('per_page', 10));
-        if ($perPage < 1) $perPage = 10;
-        if ($perPage > 100) $perPage = 100;
+        try {
+            $perPage = (int) ($request->query('per_page', 10));
+            if ($perPage < 1) $perPage = 10;
+            if ($perPage > 100) $perPage = 100;
 
-        $q = Referral::query()
-            ->where('requested_by_id', (int) $actor->id)
-            ->with([
-                'student:id,name,email,role,student_id,program,course,year_level',
-                'requestedBy:id,name,email,role',
-                'counselor:id,name,email,role',
-            ])
-            ->orderByDesc('created_at')
-            ->orderByDesc('id');
+            $q = Referral::query()
+                ->where('requested_by_id', (int) $actor->id)
+                ->with($this->referralWith())
+                ->orderByDesc('created_at')
+                ->orderByDesc('id');
 
-        $p = $q->paginate($perPage);
+            $p = $q->paginate($perPage);
 
-        return response()->json([
-            'message' => 'Fetched your referrals.',
-            'referrals' => $p->items(),
-            'meta' => [
-                'current_page' => $p->currentPage(),
-                'per_page' => $p->perPage(),
-                'total' => $p->total(),
-                'last_page' => $p->lastPage(),
-            ],
-        ]);
+            return response()->json([
+                'message' => 'Fetched your referrals.',
+                'referrals' => $p->items(),
+                'meta' => [
+                    'current_page' => $p->currentPage(),
+                    'per_page' => $p->perPage(),
+                    'total' => $p->total(),
+                    'last_page' => $p->lastPage(),
+                ],
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to fetch your referrals.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
     }
 
     /**
@@ -186,33 +229,35 @@ class ReferralController extends Controller
 
         if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
 
-        $ref = Referral::query()
-            ->with([
-                'student:id,name,email,role,student_id,program,course,year_level',
-                'requestedBy:id,name,email,role',
-                'counselor:id,name,email,role',
-            ])
-            ->find($id);
+        try {
+            $ref = Referral::query()
+                ->with($this->referralWith())
+                ->find($id);
 
-        if (! $ref) {
-            return response()->json(['message' => 'Referral not found.'], 404);
+            if (! $ref) {
+                return response()->json(['message' => 'Referral not found.'], 404);
+            }
+
+            $isCounselor = $this->isCounselor($actor);
+            $isReferralUser = $this->isReferralUser($actor);
+
+            if (! $isCounselor && ! $isReferralUser) {
+                return response()->json(['message' => 'Forbidden.'], 403);
+            }
+
+            if ($isReferralUser && (int) $ref->requested_by_id !== (int) $actor->id) {
+                return response()->json(['message' => 'Forbidden.'], 403);
+            }
+
+            return response()->json([
+                'referral' => $ref,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to fetch referral.',
+                'error' => $e->getMessage(),
+            ], 500);
         }
-
-        $isCounselor = $this->isCounselor($actor);
-        $isReferralUser = $this->isReferralUser($actor);
-
-        if (! $isCounselor && ! $isReferralUser) {
-            return response()->json(['message' => 'Forbidden.'], 403);
-        }
-
-        // Referral users can only view their own referrals
-        if ($isReferralUser && (int) $ref->requested_by_id !== (int) $actor->id) {
-            return response()->json(['message' => 'Forbidden.'], 403);
-        }
-
-        return response()->json([
-            'referral' => $ref,
-        ]);
     }
 
     /**
@@ -226,64 +271,73 @@ class ReferralController extends Controller
         if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
         if (! $this->isCounselor($actor)) return response()->json(['message' => 'Forbidden.'], 403);
 
-        $ref = Referral::find($id);
+        try {
+            $ref = Referral::find($id);
 
-        if (! $ref) {
-            return response()->json(['message' => 'Referral not found.'], 404);
-        }
+            if (! $ref) {
+                return response()->json(['message' => 'Referral not found.'], 404);
+            }
 
-        $data = $request->validate([
-            'status'      => ['nullable', 'in:pending,handled,closed'],
-            'remarks'     => ['nullable', 'string'],
-            'counselor_id'=> ['nullable', 'integer', 'exists:users,id'],
-        ]);
+            $data = $request->validate([
+                'status'       => ['nullable', 'in:pending,handled,closed'],
+                'remarks'      => ['nullable', 'string'],
+                'counselor_id' => ['nullable', 'integer', 'exists:users,id'],
+            ]);
 
-        if (array_key_exists('counselor_id', $data)) {
-            $counselorId = $data['counselor_id'];
+            if (array_key_exists('counselor_id', $data)) {
+                $counselorId = $data['counselor_id'];
 
-            if ($counselorId === null) {
-                $ref->counselor_id = null;
-            } else {
-                $counselor = User::find((int) $counselorId);
-                if (! $counselor) {
-                    return response()->json(['message' => 'Counselor not found.'], 404);
+                if ($counselorId === null) {
+                    $ref->counselor_id = null;
+                } else {
+                    $counselor = User::find((int) $counselorId);
+                    if (! $counselor) {
+                        return response()->json(['message' => 'Counselor not found.'], 404);
+                    }
+
+                    $role = strtolower((string) ($counselor->role ?? ''));
+                    if (
+                        ! str_contains($role, 'counselor') &&
+                        ! str_contains($role, 'counsellor') &&
+                        ! str_contains($role, 'guidance')
+                    ) {
+                        return response()->json(['message' => 'Assigned user is not a counselor.'], 422);
+                    }
+
+                    $ref->counselor_id = (int) $counselor->id;
                 }
-                $role = strtolower((string) ($counselor->role ?? ''));
-                if (! str_contains($role, 'counselor') && ! str_contains($role, 'counsellor') && ! str_contains($role, 'guidance')) {
-                    return response()->json(['message' => 'Assigned user is not a counselor.'], 422);
+            }
+
+            if (array_key_exists('remarks', $data)) {
+                $ref->remarks = $data['remarks'];
+            }
+
+            if (! empty($data['status'])) {
+                $status = strtolower((string) $data['status']);
+                $ref->status = $status;
+
+                if ($status === 'handled') {
+                    $ref->handled_at = $ref->handled_at ?? now();
                 }
-                $ref->counselor_id = (int) $counselor->id;
-            }
-        }
 
-        if (array_key_exists('remarks', $data)) {
-            $ref->remarks = $data['remarks'];
-        }
-
-        if (! empty($data['status'])) {
-            $status = strtolower((string) $data['status']);
-            $ref->status = $status;
-
-            if ($status === 'handled') {
-                $ref->handled_at = $ref->handled_at ?? now();
+                if ($status === 'closed') {
+                    $ref->closed_at = $ref->closed_at ?? now();
+                }
             }
 
-            if ($status === 'closed') {
-                $ref->closed_at = $ref->closed_at ?? now();
-            }
+            $ref->save();
+
+            $ref->load($this->referralWith());
+
+            return response()->json([
+                'message'  => 'Referral updated.',
+                'referral' => $ref,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to update referral.',
+                'error' => $e->getMessage(),
+            ], 500);
         }
-
-        $ref->save();
-
-        $ref->load([
-            'student:id,name,email,role,student_id,program,course,year_level',
-            'requestedBy:id,name,email,role',
-            'counselor:id,name,email,role',
-        ]);
-
-        return response()->json([
-            'message'  => 'Referral updated.',
-            'referral' => $ref,
-        ]);
     }
 }
