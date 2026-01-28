@@ -57,10 +57,9 @@ class NotificationController extends Controller
      * - pending_appointments (counselor)
      * - new_referrals (counselor + referral users)
      *
-     * ✅ IMPORTANT:
-     * We expose counts both:
-     * - as top-level keys (what your frontend expects)
-     * - and inside "counts" (backward compatibility)
+     * ✅ IMPORTANT CHANGE (FIX):
+     * unread_messages is now computed as "UNREAD CONVERSATIONS (latest message unread)"
+     * so the badge clears properly after the thread is already handled/read.
      */
     public function counts(Request $request): JsonResponse
     {
@@ -75,15 +74,9 @@ class NotificationController extends Controller
         $newReferrals = 0;
 
         if ($this->isCounselor($user)) {
+            // ✅ FIX: use unread conversation count (latest-message based)
             $unreadMessages = $this->safeCount(function () use ($user) {
-                return Message::query()
-                    ->where('recipient_role', 'counselor')
-                    ->where('counselor_is_read', false)
-                    ->where(function ($q) use ($user) {
-                        $q->whereNull('recipient_id')
-                          ->orWhere('recipient_id', (int) $user->id);
-                    })
-                    ->count();
+                return MessageBadgeCountController::unreadConversationCountFor($user);
             });
 
             $pendingAppointments = $this->safeCount(function () {
@@ -98,7 +91,6 @@ class NotificationController extends Controller
                     ->count();
             });
         } elseif ($this->isReferralUser($user)) {
-            // Referral users: how many of THEIR referrals are still pending
             $newReferrals = $this->safeCount(function () use ($user) {
                 return Referral::query()
                     ->where('requested_by_id', (int) $user->id)
@@ -106,16 +98,13 @@ class NotificationController extends Controller
                     ->count();
             });
 
-            // If you later implement referral-user messaging + read flags, update here.
+            // If you later implement referral-user messaging read flags, update this.
             $unreadMessages = 0;
             $pendingAppointments = 0;
         } else {
-            // Student/Guest: unread messages for their thread
+            // ✅ FIX: student/guest unread conversation count (latest-message based)
             $unreadMessages = $this->safeCount(function () use ($user) {
-                return Message::query()
-                    ->where('user_id', (int) $user->id)
-                    ->where('is_read', false)
-                    ->count();
+                return MessageBadgeCountController::unreadConversationCountFor($user);
             });
 
             $pendingAppointments = 0;
@@ -125,12 +114,12 @@ class NotificationController extends Controller
         return response()->json([
             'message' => 'Fetched notification counts.',
 
-            // ✅ top-level keys (frontend badge mapping)
+            // top-level keys (frontend badge mapping)
             'unread_messages' => $unreadMessages,
             'pending_appointments' => $pendingAppointments,
             'new_referrals' => $newReferrals,
 
-            // ✅ keep nested counts too (compat)
+            // keep nested counts too (compat)
             'counts' => [
                 'unread_messages' => $unreadMessages,
                 'pending_appointments' => $pendingAppointments,
