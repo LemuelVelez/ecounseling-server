@@ -22,6 +22,20 @@ class AnalyticsController extends Controller
             || str_contains($role, 'guidance');
     }
 
+    private function isAdmin(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+
+        return str_contains($role, 'admin');
+    }
+
+    private function canViewAnalytics(?User $user): bool
+    {
+        return $this->isCounselor($user) || $this->isAdmin($user);
+    }
+
     /**
      * Build DB-driver-safe YEAR/MONTH expressions for the given column.
      *
@@ -35,9 +49,6 @@ class AnalyticsController extends Controller
     {
         $driver = DB::getDriverName();
 
-        // NOTE: $column here is a column name, not user input.
-        // Keep it simple; no quoting needed for standard columns.
-
         if ($driver === 'pgsql') {
             return [
                 'year_select'  => "EXTRACT(YEAR FROM {$column})::int",
@@ -48,7 +59,6 @@ class AnalyticsController extends Controller
         }
 
         if ($driver === 'sqlite') {
-            // SQLite stores datetimes as text; use strftime and cast to integer.
             return [
                 'year_select'  => "CAST(strftime('%Y', {$column}) AS INTEGER)",
                 'month_select' => "CAST(strftime('%m', {$column}) AS INTEGER)",
@@ -57,7 +67,6 @@ class AnalyticsController extends Controller
             ];
         }
 
-        // MySQL / MariaDB / SQL Server
         return [
             'year_select'  => "YEAR({$column})",
             'month_select' => "MONTH({$column})",
@@ -68,6 +77,7 @@ class AnalyticsController extends Controller
 
     /**
      * GET /counselor/analytics
+     * GET /admin/analytics
      *
      * Returns:
      * - this_month_count
@@ -84,7 +94,7 @@ class AnalyticsController extends Controller
         $actor = $request->user();
 
         if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
-        if (! $this->isCounselor($actor)) return response()->json(['message' => 'Forbidden.'], 403);
+        if (! $this->canViewAnalytics($actor)) return response()->json(['message' => 'Forbidden.'], 403);
 
         $startRaw = trim((string) $request->query('start_date', ''));
         $endRaw   = trim((string) $request->query('end_date', ''));

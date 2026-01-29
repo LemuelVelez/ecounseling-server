@@ -10,6 +10,9 @@ use App\Http\Controllers\StudentProfileController;
 use App\Http\Controllers\Admin\AdminRoleController;
 use App\Http\Controllers\Admin\AdminUserController;
 
+// ✅ NEW: Admin Messages controller
+use App\Http\Controllers\Admin\MessageController as AdminMessageController;
+
 // ✅ NEW controllers
 use App\Http\Controllers\AnalyticsController;
 use App\Http\Controllers\NotificationController;
@@ -658,6 +661,10 @@ Route::middleware('auth')->get('users', function (Request $request) {
 */
 
 Route::middleware('auth')->prefix('admin')->group(function () {
+    // ✅ NEW: Admin analytics endpoint (fixes 404 from the React admin analytics page)
+    Route::get('analytics', [AnalyticsController::class, 'summary'])
+        ->name('admin.analytics.summary');
+
     Route::get('roles', [AdminRoleController::class, 'index'])
         ->name('admin.roles.index');
 
@@ -680,4 +687,33 @@ Route::middleware('auth')->prefix('admin')->group(function () {
     Route::patch('users/{user}/role', [AdminUserController::class, 'updateRole'])
         ->whereNumber('user')
         ->name('admin.users.role.update');
+
+    /*
+    |--------------------------------------------------------------------------
+    | ✅ NEW: Admin messages endpoints
+    |--------------------------------------------------------------------------
+    | - GET    /admin/messages
+    | - GET    /admin/messages/conversations/{conversationId}
+    | - DELETE /admin/messages/conversations/{conversationId}
+    | - PATCH  /admin/messages/{id}
+    | - DELETE /admin/messages/{id}
+    */
+    Route::get('messages', [AdminMessageController::class, 'index'])
+        ->name('admin.messages.index');
+
+    Route::get('messages/conversations/{conversationId}', [AdminMessageController::class, 'showConversation'])
+        ->where('conversationId', '.+')
+        ->name('admin.messages.conversations.show');
+
+    Route::delete('messages/conversations/{conversationId}', [AdminMessageController::class, 'destroyConversation'])
+        ->where('conversationId', '.+')
+        ->name('admin.messages.conversations.destroy');
+
+    Route::match(['PATCH', 'PUT'], 'messages/{id}', [AdminMessageController::class, 'update'])
+        ->whereNumber('id')
+        ->name('admin.messages.update');
+
+    Route::delete('messages/{id}', [AdminMessageController::class, 'destroy'])
+        ->whereNumber('id')
+        ->name('admin.messages.destroy');
 });
