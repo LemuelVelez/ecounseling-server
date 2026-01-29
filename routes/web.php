@@ -667,6 +667,17 @@ Route::middleware('auth')->prefix('admin')->group(function () {
     Route::post('users', [AdminUserController::class, 'store'])
         ->name('admin.users.store');
 
+    // ✅ FIX: allow editing users (frontend calls PATCH /admin/users/{id})
+    Route::match(['PATCH', 'PUT'], 'users/{user}', [AdminUserController::class, 'update'])
+        ->whereNumber('user')
+        ->name('admin.users.update');
+
+    // ✅ FIX: allow deleting users (frontend calls DELETE /admin/users/{id})
+    Route::delete('users/{user}', [AdminUserController::class, 'destroy'])
+        ->whereNumber('user')
+        ->name('admin.users.destroy');
+
     Route::patch('users/{user}/role', [AdminUserController::class, 'updateRole'])
+        ->whereNumber('user')
         ->name('admin.users.role.update');
 });

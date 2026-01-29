@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 
 class AdminUserController extends Controller
@@ -19,7 +20,7 @@ class AdminUserController extends Controller
         $this->requireAdmin($request);
 
         $users = User::query()
-            ->select(['id', 'name', 'email', 'role', 'gender', 'avatar_url', 'account_type'])
+            ->select(['id', 'name', 'email', 'role', 'gender', 'avatar_url', 'account_type', 'created_at'])
             ->orderByDesc('id')
             ->get();
 
@@ -28,37 +29,55 @@ class AdminUserController extends Controller
         ]);
     }
 
+    /**
+     * Treat dean/registrar/program chair as ONE: referral_user.
+     */
     private function isReferralRole(string $role): bool
     {
         $r = strtolower(trim($role));
 
-        return str_contains($r, 'dean')
+        return str_contains($r, 'referral')
+            || str_contains($r, 'dean')
             || str_contains($r, 'registrar')
             || str_contains($r, 'program chair')
             || str_contains($r, 'program_chair')
             || str_contains($r, 'programchair');
     }
 
-    private function requireInstitutionEmailIfReferralRole(string $email, string $role, ?callable $fail = null): bool
+    /**
+     * Force storage role for referral bucket.
+     */
+    private function normalizeRoleForStorage(string $role): string
     {
-        if (! $this->isReferralRole($role)) {
-            return true;
+        $role = trim((string) $role);
+        if ($role === '') return $role;
+
+        if ($this->isReferralRole($role)) {
+            return 'referral_user';
         }
 
-        // ✅ configurable official domain
-        $domain = trim((string) env('INSTITUTION_EMAIL_DOMAIN', 'jrmsu.edu.ph'));
-        $domain = ltrim($domain, '@');
+        return $role;
+    }
 
-        $emailLower = strtolower(trim($email));
-        $domainLower = strtolower($domain);
+    /**
+     * ✅ Account type is ONLY student|guest (per DB constraint).
+     * Referral is a ROLE only, so it must NEVER become account_type.
+     */
+    private function accountTypeForRole(string $role): string
+    {
+        $r = strtolower(trim((string) $role));
 
-        $ok = str_ends_with($emailLower, '@' . $domainLower);
-
-        if (! $ok && $fail) {
-            $fail("Referral user emails must use the official domain: @$domainLower");
+        if (str_contains($r, 'student')) {
+            return 'student';
         }
 
-        return $ok;
+        // everything else (admin/counselor/guest/referral_user/etc) => guest
+        return 'guest';
+    }
+
+    private function userPayload(User $user): array
+    {
+        return $user->only(['id', 'name', 'email', 'role', 'gender', 'avatar_url', 'account_type', 'created_at']);
     }
 
     /**
@@ -71,40 +90,23 @@ class AdminUserController extends Controller
 
         $data = $request->validate([
             'name'                  => ['required', 'string', 'max:255'],
-            'email'                 => [
-                'required',
-                'email',
-                'max:255',
-                'unique:users,email',
-                function ($attribute, $value, $fail) use ($request) {
-                    $role = (string) $request->input('role', '');
-                    $this->requireInstitutionEmailIfReferralRole((string) $value, (string) $role, $fail);
-                },
-            ],
+            'email'                 => ['required', 'email', 'max:255', 'unique:users,email'],
             'role'                  => ['required', 'string', 'max:50'],
             'gender'                => ['nullable', 'string', 'max:50'],
             'password'              => ['required', 'string', Password::min(8), 'confirmed'],
             'password_confirmation' => ['required', 'string'],
         ]);
 
-        $role = trim((string) $data['role']);
-        $normalizedRole = strtolower($role);
-
-        // ✅ Account type mapping (keeps your existing logic but adds "referral")
-        $accountType = 'guest';
-
-        if (str_contains($normalizedRole, 'student')) {
-            $accountType = 'student';
-        } elseif ($this->isReferralRole($role)) {
-            $accountType = 'referral';
-        }
+        $role = $this->normalizeRoleForStorage((string) $data['role']);
 
         $user = new User();
         $user->name = $data['name'];
         $user->email = $data['email'];
         $user->role = $role;
         $user->gender = $data['gender'] ?? null;
-        $user->account_type = $accountType;
+
+        // ✅ account_type stays ONLY student|guest
+        $user->account_type = $this->accountTypeForRole($role);
 
         // Will be hashed automatically by the User model "password" cast
         $user->password = $data['password'];
@@ -113,8 +115,55 @@ class AdminUserController extends Controller
 
         return response()->json([
             'message' => 'User created successfully.',
-            'user'    => $user->only(['id', 'name', 'email', 'role', 'gender', 'avatar_url', 'account_type']),
+            'user'    => $this->userPayload($user),
         ], 201);
+    }
+
+    /**
+     * PATCH /admin/users/{user}
+     * Update user fields (CRUD: Update).
+     */
+    public function update(Request $request, User $user): JsonResponse
+    {
+        $this->requireAdmin($request);
+
+        $data = $request->validate([
+            'name'                  => ['required', 'string', 'max:255'],
+            'email'                 => [
+                'required',
+                'email',
+                'max:255',
+                Rule::unique('users', 'email')->ignore($user->id),
+            ],
+            'role'                  => ['required', 'string', 'max:50'],
+            'gender'                => ['nullable', 'string', 'max:50'],
+            'password'              => ['nullable', 'string', Password::min(8), 'confirmed'],
+            'password_confirmation' => ['nullable', 'string'],
+        ]);
+
+        $role = $this->normalizeRoleForStorage((string) $data['role']);
+
+        $user->name = (string) $data['name'];
+        $user->email = (string) $data['email'];
+        $user->role = $role;
+
+        // allow null
+        $user->gender = $data['gender'] ?? null;
+
+        // ✅ IMPORTANT: DO NOT change account_type when updating role/info.
+        // account_type is student|guest only, and referral_user is ROLE only.
+
+        // Only update password if provided
+        if (!empty($data['password'])) {
+            $user->password = (string) $data['password'];
+        }
+
+        $user->save();
+
+        return response()->json([
+            'message' => 'User updated successfully.',
+            'user'    => $this->userPayload($user),
+        ]);
     }
 
     /**
@@ -129,25 +178,40 @@ class AdminUserController extends Controller
             'role' => ['required', 'string', 'max:50'],
         ]);
 
-        $role = trim((string) $data['role']);
-        $normalizedRole = strtolower($role);
+        $role = $this->normalizeRoleForStorage((string) $data['role']);
 
         $user->role = $role;
 
-        // ✅ keep account_type aligned
-        if (str_contains($normalizedRole, 'student')) {
-            $user->account_type = 'student';
-        } elseif ($this->isReferralRole($role)) {
-            $user->account_type = 'referral';
-        } else {
-            $user->account_type = 'guest';
-        }
+        // ✅ IMPORTANT: DO NOT change account_type here.
+        // account_type constraint only allows student|guest.
 
         $user->save();
 
         return response()->json([
             'message' => 'Role updated successfully.',
-            'user'    => $user->only(['id', 'name', 'email', 'role', 'gender', 'avatar_url', 'account_type']),
+            'user'    => $this->userPayload($user),
+        ]);
+    }
+
+    /**
+     * DELETE /admin/users/{user}
+     * Delete a user (CRUD: Delete).
+     */
+    public function destroy(Request $request, User $user): JsonResponse
+    {
+        $this->requireAdmin($request);
+
+        $authUser = $request->user();
+        if ($authUser && (string) $authUser->id === (string) $user->id) {
+            return response()->json([
+                'message' => 'You cannot delete your own account.',
+            ], 422);
+        }
+
+        $user->delete();
+
+        return response()->json([
+            'message' => 'User deleted successfully.',
         ]);
     }
 
@@ -155,13 +219,13 @@ class AdminUserController extends Controller
     {
         $authUser = $request->user();
 
-        if (! $authUser) {
+        if (!$authUser) {
             abort(401, 'Unauthenticated.');
         }
 
         $role = strtolower(trim((string) ($authUser->role ?? '')));
 
-        if (! str_contains($role, 'admin')) {
+        if (!str_contains($role, 'admin')) {
             abort(403, 'Forbidden.');
         }
     }
