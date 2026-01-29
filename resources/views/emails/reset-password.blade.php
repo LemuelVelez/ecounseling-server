@@ -3,7 +3,7 @@
 
     <head>
         <meta charset="utf-8">
-        <title>Reset your eCounseling password</title>
+        <title>Reset your E-Guidance Appointment System password</title>
     </head>
 
     <body
@@ -16,7 +16,7 @@
                         <tr>
                             <td>
                                 <h1 style="font-size:20px; margin-bottom:16px; color:#92400e;">
-                                    Reset your eCounseling password
+                                    Reset your E-Guidance Appointment System password
                                 </h1>
 
                                 <p style="font-size:14px; color:#374151; margin-bottom:12px;">
@@ -25,8 +25,8 @@
 
                                 <p style="font-size:14px; color:#374151; margin-bottom:16px;">
                                     We received a request to reset the password for your JRMSU
-                                    eCounseling Portal account. If you made this request, please
-                                    click the button below to create a new password.
+                                    E-Guidance Appointment System account. If you made this request,
+                                    please click the button below to create a new password.
                                 </p>
 
                                 <p style="text-align:center; margin: 24px 0;">
@@ -49,7 +49,7 @@
                                 </p>
 
                                 <p style="font-size:12px; color:#6b7280;">
-                                    &mdash; JRMSU eCounseling Portal
+                                    &mdash; JRMSU E-Guidance Appointment System
                                 </p>
                             </td>
                         </tr>

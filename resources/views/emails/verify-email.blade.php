@@ -3,7 +3,7 @@
 
     <head>
         <meta charset="utf-8">
-        <title>Verify your eCounseling email</title>
+        <title>Verify your E-Guidance Appointment System email</title>
     </head>
 
     <body
@@ -16,7 +16,7 @@
                         <tr>
                             <td>
                                 <h1 style="font-size:20px; margin-bottom:16px; color:#92400e;">
-                                    Verify your eCounseling email
+                                    Verify your E-Guidance Appointment System email
                                 </h1>
 
                                 <p style="font-size:14px; color:#374151; margin-bottom:12px;">
@@ -24,7 +24,7 @@
                                 </p>
 
                                 <p style="font-size:14px; color:#374151; margin-bottom:16px;">
-                                    Thank you for registering for the JRMSU eCounseling Portal.
+                                    Thank you for registering for the JRMSU E-Guidance Appointment System.
                                     Please confirm that this is your email address by clicking the button below.
                                 </p>
 
@@ -48,7 +48,7 @@
                                 </p>
 
                                 <p style="font-size:12px; color:#6b7280;">
-                                    &mdash; JRMSU eCounseling Portal
+                                    &mdash; JRMSU E-Guidance Appointment System
                                 </p>
                             </td>
                         </tr>
