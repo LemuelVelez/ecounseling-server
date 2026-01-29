@@ -146,12 +146,10 @@ class CounselorMessageController extends Controller
     /**
      * GET /counselor/messages
      *
-     * ✅ FIX:
-     * - Include sender/recipient avatars so Messages UI can render peerAvatarUrl.
-     * - For student/guest messages that may not have sender_id, fall back to messages.user_id's avatar.
-     *
-     * Read flag behavior:
-     * - For counselor context, we alias counselor_is_read as is_read in the response.
+     * ✅ FIX (names):
+     * - Always return a resolved sender_name (fallback to joined users.name).
+     * - Always return a resolved recipient_name for counselor-sent threads:
+     *   recipient_u.name OR owner_u.name (covers legacy rows where recipient_id is null but user_id is the student).
      */
     public function index(Request $request): JsonResponse
     {
@@ -168,8 +166,35 @@ class CounselorMessageController extends Controller
         // Effective conversation id used in joins + response (covers any legacy nulls)
         $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
 
+        // ✅ Resolved sender_name:
+        // - system => "Guidance & Counseling Office" (unless sender_name already stored)
+        // - else   => messages.sender_name (if present) then sender user name then owner user name
+        $resolvedSenderNameSql = "
+            CASE
+                WHEN LOWER(COALESCE(messages.sender, '')) = 'system'
+                    THEN COALESCE(NULLIF(messages.sender_name, ''), 'Guidance & Counseling Office')
+                ELSE
+                    COALESCE(
+                        NULLIF(messages.sender_name, ''),
+                        NULLIF(sender_u.name, ''),
+                        NULLIF(owner_u.name, '')
+                    )
+            END
+        ";
+
+        // ✅ Resolved recipient_name:
+        // For peer roles (student/guest/admin/referral_user), use recipient_u.name OR owner_u.name (legacy-safe)
+        // For counselor recipients, keep recipient_u.name only (avoid accidentally using owner_u which may be sender)
+        $resolvedRecipientNameSql = "
+            CASE
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) IN ('student','guest','admin','referral_user','dean','registrar','program_chair')
+                    THEN COALESCE(NULLIF(recipient_u.name, ''), NULLIF(owner_u.name, ''))
+                ELSE NULLIF(recipient_u.name, '')
+            END
+        ";
+
         $messages = Message::query()
-            // ✅ Join users for avatar lookup
+            // ✅ Join users for avatar + name lookup
             ->leftJoin('users as sender_u', 'messages.sender_id', '=', 'sender_u.id')
             ->leftJoin('users as recipient_u', 'messages.recipient_id', '=', 'recipient_u.id')
             ->leftJoin('users as owner_u', 'messages.user_id', '=', 'owner_u.id')
@@ -212,7 +237,6 @@ class CounselorMessageController extends Controller
                 'messages.user_id',
                 'messages.sender',
                 'messages.sender_id',
-                'messages.sender_name',
                 'messages.recipient_id',
                 'messages.recipient_role',
                 'messages.content',
@@ -221,6 +245,11 @@ class CounselorMessageController extends Controller
             ])
             ->selectRaw($effectiveConversationIdSql . ' as conversation_id')
             ->selectRaw('messages.counselor_is_read as is_read')
+
+            // ✅ Names
+            ->selectRaw($resolvedSenderNameSql . ' as sender_name')
+            ->selectRaw($resolvedRecipientNameSql . ' as recipient_name')
+            ->selectRaw("NULLIF(owner_u.name, '') as user_name")
 
             // ✅ Avatar fields for frontend (peerAvatarUrl)
             ->selectRaw("COALESCE(sender_u.avatar_url, owner_u.avatar_url) as sender_avatar_url")
@@ -259,7 +288,7 @@ class CounselorMessageController extends Controller
 
         $data = $request->validate([
             'content' => ['required', 'string'],
-            // ✅ allow admin
+            // ✅ allow admin (and keep existing list)
             'recipient_role' => ['nullable', 'in:student,guest,counselor,admin'],
             'recipient_id' => ['nullable', 'integer', 'exists:users,id'],
 
@@ -370,7 +399,7 @@ class CounselorMessageController extends Controller
 
         $message->save();
 
-        // ✅ include avatar URLs in response so UI updates immediately
+        // ✅ include avatar URLs + names in response so UI updates immediately
         $senderAvatar = $this->resolveAvatarUrl($user->avatar_url ?? null);
         $recipientAvatar = $this->resolveAvatarUrl($recipientUser?->avatar_url ?? null);
 
@@ -382,6 +411,7 @@ class CounselorMessageController extends Controller
             'sender_name' => $message->sender_name,
             'recipient_id' => $message->recipient_id,
             'recipient_role' => $message->recipient_role,
+            'recipient_name' => $recipientUser?->name ?? null,
             'conversation_id' => $message->conversation_id,
             'content' => $message->content,
             'is_read' => (bool) $message->counselor_is_read,
