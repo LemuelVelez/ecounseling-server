@@ -9,7 +9,7 @@ return [
     |
     */
 
-    // ✅ Enable CORS on ALL routes your SPA may call (including conversation delete endpoints).
+    // ✅ Enable CORS on ALL routes your SPA may call (including referral-user).
     'paths' => [
         'auth/*',
 
@@ -17,6 +17,10 @@ return [
         'student/*',
         'counselor/*',
         'admin/*',
+
+        // ✅ FIX: referral-user APIs (this was missing => no CORS headers => browser blocks)
+        'referral-user',
+        'referral-user/*',
 
         // ✅ FIX: notifications endpoint (badges)
         'notifications',

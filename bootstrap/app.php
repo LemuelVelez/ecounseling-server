@@ -33,6 +33,9 @@ return Application::configure(basePath: dirname(__DIR__))
                 'counselor/*',
                 'admin/*',
 
+                // ✅ FIX: referral-user JSON endpoints (so POST won't 419)
+                'referral-user/*',
+
                 // ✅ conversation/thread delete endpoints used by the frontend
                 'messages',
                 'messages/*',

@@ -20,6 +20,9 @@ use App\Http\Controllers\ReferralController;
 use App\Http\Controllers\ManualAssessmentScoreController;
 use App\Http\Controllers\CounselorStudentController;
 
+// ✅ NEW: Referral User Messages controller
+use App\Http\Controllers\ReferralUserMessageController;
+
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -33,6 +36,7 @@ Route::get('/', function () {
 |--------------------------------------------------------------------------
 | ✅ FIX: Serve public storage files (avatars) reliably
 |--------------------------------------------------------------------------
+|
 | If the storage symlink is missing in some environments, /storage/* will 404.
 | This route serves files from the "public" disk (storage/app/public).
 |
@@ -251,17 +255,17 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.messages.markAsRead');
 
     /*
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     | ✅ NEW: Analytics endpoint
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     Route::get('analytics', [AnalyticsController::class, 'summary'])
         ->name('counselor.analytics.summary');
 
     /*
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     | ✅ NEW: Referral module endpoints (counselor side)
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     Route::get('referrals', [ReferralController::class, 'counselorIndex'])
         ->name('counselor.referrals.index');
@@ -275,9 +279,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.referrals.update');
 
     /*
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     | ✅ NEW: Student profile + history (counselor view)
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     Route::get('students/{id}', [CounselorStudentController::class, 'show'])
         ->whereNumber('id')
@@ -288,9 +292,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.students.history');
 
     /*
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     | ✅ NEW: Hardcopy assessment score encoding
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     Route::get('case-load', [ManualAssessmentScoreController::class, 'caseLoad'])
         ->name('counselor.case_load.index');
@@ -302,9 +306,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.manual_scores.index');
 
     /*
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     | ✅ FIX: Counselor directory aliases to stop 404s from the React app
-    |----------------------------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     Route::get('students', function (Request $request) {
         return directoryResponse($request, 'student');
@@ -336,6 +340,7 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 | ✅ NEW: Referral User endpoints (Dean/Registrar/Program Chair)
 |--------------------------------------------------------------------------
 | They can create referrals + view their own referral history.
+| ✅ PLUS: referral-user messages endpoints (FIX 404 + privacy)
 */
 Route::middleware('auth')->prefix('referral-user')->group(function () {
     Route::post('referrals', [ReferralController::class, 'store'])
@@ -347,6 +352,25 @@ Route::middleware('auth')->prefix('referral-user')->group(function () {
     Route::get('referrals/{id}', [ReferralController::class, 'show'])
         ->whereNumber('id')
         ->name('referral_user.referrals.show');
+
+    // ✅ FIX: Referral user messages (these were missing, causing 404)
+    Route::get('messages', [ReferralUserMessageController::class, 'index'])
+        ->name('referral_user.messages.index');
+
+    Route::post('messages', [ReferralUserMessageController::class, 'store'])
+        ->name('referral_user.messages.store');
+
+    Route::post('messages/mark-as-read', [ReferralUserMessageController::class, 'markAsRead'])
+        ->name('referral_user.messages.markAsRead');
+
+    // ✅ Needed by your referral-user/messages.tsx for edit/delete
+    Route::match(['PATCH', 'PUT'], 'messages/{id}', [ReferralUserMessageController::class, 'update'])
+        ->whereNumber('id')
+        ->name('referral_user.messages.update');
+
+    Route::delete('messages/{id}', [ReferralUserMessageController::class, 'destroy'])
+        ->whereNumber('id')
+        ->name('referral_user.messages.destroy');
 });
 
 /*
