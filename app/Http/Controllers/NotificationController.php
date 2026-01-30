@@ -3,11 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Models\IntakeRequest;
-use App\Models\Message;
 use App\Models\Referral;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 
 class NotificationController extends Controller
 {
@@ -28,11 +28,58 @@ class NotificationController extends Controller
 
         $role = strtolower((string) ($user->role ?? ''));
 
-        return str_contains($role, 'dean')
+        // ✅ include your actual role string too
+        return str_contains($role, 'referral_user')
+            || str_contains($role, 'referral user')
+            || str_contains($role, 'dean')
             || str_contains($role, 'registrar')
             || str_contains($role, 'program chair')
             || str_contains($role, 'program_chair')
             || str_contains($role, 'programchair');
+    }
+
+    /**
+     * ✅ Resolve authenticated user across possible guards (web/session OR api/sanctum token).
+     */
+    private function resolveUser(Request $request): ?User
+    {
+        // Default resolver (uses current selected guard if any middleware set it)
+        $u = $request->user();
+        if ($u instanceof User) return $u;
+
+        // Explicit guards (only if configured)
+        try {
+            $u = $request->user('web');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = $request->user('api');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = $request->user('sanctum');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        // Auth facade fallbacks
+        try {
+            $u = Auth::guard('web')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = Auth::guard('api')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = Auth::guard('sanctum')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        return null;
     }
 
     /**
@@ -52,21 +99,29 @@ class NotificationController extends Controller
     /**
      * GET /notifications/counts
      *
-     * Returns notification badges:
-     * - unread_messages
-     * - pending_appointments (counselor)
-     * - new_referrals (counselor + referral users)
-     *
-     * ✅ IMPORTANT CHANGE (FIX):
-     * unread_messages is now computed as "UNREAD CONVERSATIONS (latest message unread)"
-     * so the badge clears properly after the thread is already handled/read.
+     * ✅ IMPORTANT:
+     * - This route is NOT behind auth middleware (see routes/web.php).
+     * - If unauthenticated, return 200 with zero counts (no console spam).
      */
     public function counts(Request $request): JsonResponse
     {
-        $user = $request->user();
+        $user = $this->resolveUser($request);
 
         if (! $user) {
-            return response()->json(['message' => 'Unauthenticated.'], 401);
+            return response()->json([
+                'message' => 'Fetched notification counts.',
+                'unauthenticated' => true,
+
+                'unread_messages' => 0,
+                'pending_appointments' => 0,
+                'new_referrals' => 0,
+
+                'counts' => [
+                    'unread_messages' => 0,
+                    'pending_appointments' => 0,
+                    'new_referrals' => 0,
+                ],
+            ], 200);
         }
 
         $unreadMessages = 0;
@@ -74,7 +129,6 @@ class NotificationController extends Controller
         $newReferrals = 0;
 
         if ($this->isCounselor($user)) {
-            // ✅ FIX: use unread conversation count (latest-message based)
             $unreadMessages = $this->safeCount(function () use ($user) {
                 return MessageBadgeCountController::unreadConversationCountFor($user);
             });
@@ -98,11 +152,9 @@ class NotificationController extends Controller
                     ->count();
             });
 
-            // If you later implement referral-user messaging read flags, update this.
             $unreadMessages = 0;
             $pendingAppointments = 0;
         } else {
-            // ✅ FIX: student/guest unread conversation count (latest-message based)
             $unreadMessages = $this->safeCount(function () use ($user) {
                 return MessageBadgeCountController::unreadConversationCountFor($user);
             });
@@ -113,13 +165,12 @@ class NotificationController extends Controller
 
         return response()->json([
             'message' => 'Fetched notification counts.',
+            'unauthenticated' => false,
 
-            // top-level keys (frontend badge mapping)
             'unread_messages' => $unreadMessages,
             'pending_appointments' => $pendingAppointments,
             'new_referrals' => $newReferrals,
 
-            // keep nested counts too (compat)
             'counts' => [
                 'unread_messages' => $unreadMessages,
                 'pending_appointments' => $pendingAppointments,

@@ -23,6 +23,8 @@ use App\Http\Controllers\CounselorStudentController;
 // ✅ NEW: Referral User Messages controller
 use App\Http\Controllers\ReferralUserMessageController;
 
+use App\Http\Middleware\AuthenticateAnyGuard;
+
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -33,9 +35,9 @@ Route::get('/', function () {
 });
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | ✅ FIX: Serve public storage files (avatars) reliably
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 |
 | If the storage symlink is missing in some environments, /storage/* will 404.
 | This route serves files from the "public" disk (storage/app/public).
@@ -77,11 +79,10 @@ Route::get('storage/{path}', function (Request $request, string $path) {
 })->where('path', '.*')->name('storage.public');
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | JSON auth API for the React frontend
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 */
-
 Route::prefix('auth')->group(function () {
     Route::post('login', [AuthController::class, 'login'])->name('auth.login');
     Route::post('register', [AuthController::class, 'register'])->name('auth.register');
@@ -102,37 +103,38 @@ Route::prefix('auth')->group(function () {
 });
 
 /*
-|--------------------------------------------------------------------------
-| ✅ NEW: Notification counts endpoint (badges)
-|--------------------------------------------------------------------------
-| unread messages count
-| pending appointments count (counselor)
-| new referrals count (counselor + referral users)
+|--------------------------------------------------------------------------|
+| ✅ Notification counts endpoint (badges)
+|--------------------------------------------------------------------------|
+| IMPORTANT FIX:
+| - DO NOT put this behind auth middleware, because the route middleware
+|   will return 401 BEFORE your controller can return 200 with zeros.
+| - Controller already returns 200 with zeros if unauthenticated.
 */
-Route::middleware('auth')->get('notifications/counts', [NotificationController::class, 'counts'])
+Route::get('notifications/counts', [NotificationController::class, 'counts'])
     ->name('notifications.counts');
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | ✅ FIX: Message update/delete endpoints (for editing messages)
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | Frontend calls:
 | - PATCH /messages/{id}
 | - PUT   /messages/{id}
 | - DELETE /messages/{id}
 */
-Route::middleware('auth')->match(['PATCH', 'PUT'], 'messages/{id}', [MessageController::class, 'update'])
+Route::middleware(AuthenticateAnyGuard::class)->match(['PATCH', 'PUT'], 'messages/{id}', [MessageController::class, 'update'])
     ->whereNumber('id')
     ->name('messages.update');
 
-Route::middleware('auth')->delete('messages/{id}', [MessageController::class, 'destroy'])
+Route::middleware(AuthenticateAnyGuard::class)->delete('messages/{id}', [MessageController::class, 'destroy'])
     ->whereNumber('id')
     ->name('messages.destroy');
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | ✅ Conversation delete endpoints (persist delete across refresh)
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 |
 | Frontend tries these candidates:
 | - DELETE /messages/conversations/{conversationId}
@@ -141,25 +143,24 @@ Route::middleware('auth')->delete('messages/{id}', [MessageController::class, 'd
 |
 | We implement all 3 and "delete" means: hide for the current user only.
 */
-Route::middleware('auth')->delete('messages/conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
+Route::middleware(AuthenticateAnyGuard::class)->delete('messages/conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
     ->where('conversationId', '.+')
     ->name('messages.conversations.destroy');
 
-Route::middleware('auth')->delete('messages/thread/{conversationId}', [MessageConversationController::class, 'destroy'])
+Route::middleware(AuthenticateAnyGuard::class)->delete('messages/thread/{conversationId}', [MessageConversationController::class, 'destroy'])
     ->where('conversationId', '.+')
     ->name('messages.thread.destroy');
 
-Route::middleware('auth')->delete('conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
+Route::middleware(AuthenticateAnyGuard::class)->delete('conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
     ->where('conversationId', '.+')
     ->name('conversations.destroy');
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | Student counseling intake, evaluation & messages routes
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 */
-
-Route::middleware('auth')->prefix('student')->group(function () {
+Route::middleware(AuthenticateAnyGuard::class)->prefix('student')->group(function () {
     Route::post('intake/assessment', [IntakeController::class, 'storeAssessment'])
         ->name('student.intake.assessment.store');
 
@@ -211,12 +212,11 @@ Route::middleware('auth')->prefix('student')->group(function () {
 });
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | Counselor intake review routes + counselor messages
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 */
-
-Route::middleware('auth')->prefix('counselor')->group(function () {
+Route::middleware(AuthenticateAnyGuard::class)->prefix('counselor')->group(function () {
     Route::get('intake/requests', [IntakeController::class, 'counselorRequests'])
         ->name('counselor.intake.requests.index');
 
@@ -255,17 +255,17 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.messages.markAsRead');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ NEW: Analytics endpoint
-    |--------------------------------------------------------------------------
+    |--------------------------------------------------------------------------|
+    | ✅ Analytics endpoint
+    |--------------------------------------------------------------------------|
     */
     Route::get('analytics', [AnalyticsController::class, 'summary'])
         ->name('counselor.analytics.summary');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ NEW: Referral module endpoints (counselor side)
-    |--------------------------------------------------------------------------
+    |--------------------------------------------------------------------------|
+    | ✅ Referral module endpoints (counselor side)
+    |--------------------------------------------------------------------------|
     */
     Route::get('referrals', [ReferralController::class, 'counselorIndex'])
         ->name('counselor.referrals.index');
@@ -279,9 +279,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.referrals.update');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ NEW: Student profile + history (counselor view)
-    |--------------------------------------------------------------------------
+    |--------------------------------------------------------------------------|
+    | ✅ Student profile + history (counselor view)
+    |--------------------------------------------------------------------------|
     */
     Route::get('students/{id}', [CounselorStudentController::class, 'show'])
         ->whereNumber('id')
@@ -292,9 +292,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.students.history');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ NEW: Hardcopy assessment score encoding
-    |--------------------------------------------------------------------------
+    |--------------------------------------------------------------------------|
+    | ✅ Hardcopy assessment score encoding
+    |--------------------------------------------------------------------------|
     */
     Route::get('case-load', [ManualAssessmentScoreController::class, 'caseLoad'])
         ->name('counselor.case_load.index');
@@ -306,9 +306,9 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
         ->name('counselor.manual_scores.index');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ FIX: Counselor directory aliases to stop 404s from the React app
-    |--------------------------------------------------------------------------
+    |--------------------------------------------------------------------------|
+    | ✅ Counselor directory aliases to stop 404s from the React app
+    |--------------------------------------------------------------------------|
     */
     Route::get('students', function (Request $request) {
         return directoryResponse($request, 'student');
@@ -336,13 +336,13 @@ Route::middleware('auth')->prefix('counselor')->group(function () {
 });
 
 /*
-|--------------------------------------------------------------------------
-| ✅ NEW: Referral User endpoints (Dean/Registrar/Program Chair)
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
+| ✅ Referral User endpoints (Dean/Registrar/Program Chair)
+|--------------------------------------------------------------------------|
 | They can create referrals + view their own referral history.
 | ✅ PLUS: referral-user messages endpoints (FIX 404 + privacy)
 */
-Route::middleware('auth')->prefix('referral-user')->group(function () {
+Route::middleware(AuthenticateAnyGuard::class)->prefix('referral-user')->group(function () {
     Route::post('referrals', [ReferralController::class, 'store'])
         ->name('referral_user.referrals.store');
 
@@ -353,7 +353,7 @@ Route::middleware('auth')->prefix('referral-user')->group(function () {
         ->whereNumber('id')
         ->name('referral_user.referrals.show');
 
-    // ✅ FIX: Referral user messages (these were missing, causing 404)
+    // ✅ Referral user messages
     Route::get('messages', [ReferralUserMessageController::class, 'index'])
         ->name('referral_user.messages.index');
 
@@ -363,7 +363,6 @@ Route::middleware('auth')->prefix('referral-user')->group(function () {
     Route::post('messages/mark-as-read', [ReferralUserMessageController::class, 'markAsRead'])
         ->name('referral_user.messages.markAsRead');
 
-    // ✅ Needed by your referral-user/messages.tsx for edit/delete
     Route::match(['PATCH', 'PUT'], 'messages/{id}', [ReferralUserMessageController::class, 'update'])
         ->whereNumber('id')
         ->name('referral_user.messages.update');
@@ -374,9 +373,9 @@ Route::middleware('auth')->prefix('referral-user')->group(function () {
 });
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | ✅ Directory endpoints
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 */
 
 function directoryCanListUsers(?User $actor, string $targetRole): bool
@@ -646,23 +645,23 @@ function directoryResponse(Request $request, string $role)
     ]);
 }
 
-Route::middleware('auth')->get('students', function (Request $request) {
+Route::middleware(AuthenticateAnyGuard::class)->get('students', function (Request $request) {
     return directoryResponse($request, 'student');
 });
 
-Route::middleware('auth')->get('guests', function (Request $request) {
+Route::middleware(AuthenticateAnyGuard::class)->get('guests', function (Request $request) {
     return directoryResponse($request, 'guest');
 });
 
-Route::middleware('auth')->get('counselors', function (Request $request) {
+Route::middleware(AuthenticateAnyGuard::class)->get('counselors', function (Request $request) {
     return directoryResponse($request, 'counselor');
 });
 
-Route::middleware('auth')->get('admins', function (Request $request) {
+Route::middleware(AuthenticateAnyGuard::class)->get('admins', function (Request $request) {
     return directoryResponse($request, 'admin');
 });
 
-Route::middleware('auth')->get('users', function (Request $request) {
+Route::middleware(AuthenticateAnyGuard::class)->get('users', function (Request $request) {
     $roles = directoryNormalizeRolesFromRequest($request);
 
     if (count($roles) === 0) {
@@ -679,13 +678,11 @@ Route::middleware('auth')->get('users', function (Request $request) {
 });
 
 /*
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 | Admin routes (for the React admin dashboard)
-|--------------------------------------------------------------------------
+|--------------------------------------------------------------------------|
 */
-
-Route::middleware('auth')->prefix('admin')->group(function () {
-    // ✅ NEW: Admin analytics endpoint (fixes 404 from the React admin analytics page)
+Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function () {
     Route::get('analytics', [AnalyticsController::class, 'summary'])
         ->name('admin.analytics.summary');
 
@@ -698,12 +695,10 @@ Route::middleware('auth')->prefix('admin')->group(function () {
     Route::post('users', [AdminUserController::class, 'store'])
         ->name('admin.users.store');
 
-    // ✅ FIX: allow editing users (frontend calls PATCH /admin/users/{id})
     Route::match(['PATCH', 'PUT'], 'users/{user}', [AdminUserController::class, 'update'])
         ->whereNumber('user')
         ->name('admin.users.update');
 
-    // ✅ FIX: allow deleting users (frontend calls DELETE /admin/users/{id})
     Route::delete('users/{user}', [AdminUserController::class, 'destroy'])
         ->whereNumber('user')
         ->name('admin.users.destroy');
@@ -713,14 +708,9 @@ Route::middleware('auth')->prefix('admin')->group(function () {
         ->name('admin.users.role.update');
 
     /*
-    |--------------------------------------------------------------------------
-    | ✅ NEW: Admin messages endpoints
-    |--------------------------------------------------------------------------
-    | - GET    /admin/messages
-    | - GET    /admin/messages/conversations/{conversationId}
-    | - DELETE /admin/messages/conversations/{conversationId}
-    | - PATCH  /admin/messages/{id}
-    | - DELETE /admin/messages/{id}
+    |--------------------------------------------------------------------------|
+    | ✅ Admin messages endpoints
+    |--------------------------------------------------------------------------|
     */
     Route::get('messages', [AdminMessageController::class, 'index'])
         ->name('admin.messages.index');

@@ -6,6 +6,7 @@ use App\Models\Message;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
 class CounselorMessageController extends Controller
@@ -19,6 +20,48 @@ class CounselorMessageController extends Controller
         return str_contains($role, 'counselor')
             || str_contains($role, 'counsellor')
             || str_contains($role, 'guidance');
+    }
+
+    /**
+     * ✅ Resolve authenticated user across possible guards (web/session OR api/sanctum token).
+     * This prevents 401 caused by "wrong guard" when the SPA uses Authorization: Bearer.
+     */
+    private function resolveUser(Request $request): ?User
+    {
+        $u = $request->user();
+        if ($u instanceof User) return $u;
+
+        try {
+            $u = $request->user('web');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = $request->user('api');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = $request->user('sanctum');
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = Auth::guard('web')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = Auth::guard('api')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        try {
+            $u = Auth::guard('sanctum')->user();
+            if ($u instanceof User) return $u;
+        } catch (\Throwable $e) {}
+
+        return null;
     }
 
     private function conversationIdFor(
@@ -80,14 +123,6 @@ class CounselorMessageController extends Controller
         return $scheme . $auth . $host . $port . $path . $query . $fragment;
     }
 
-    /**
-     * ✅ Normalize avatar_url into a usable absolute URL for the React app.
-     * Mirrors the behavior you already rely on in directory endpoints + frontend resolver:
-     * - keep data:/blob: as-is
-     * - keep absolute http(s) as-is BUT rewrite wrong /api/storage -> /storage
-     * - normalize common Laravel storage prefixes
-     * - ensure returned value is absolute via url("/storage/..")
-     */
     private function resolveAvatarUrl(?string $raw): ?string
     {
         if ($raw == null) return null;
@@ -106,7 +141,6 @@ class CounselorMessageController extends Controller
 
             $path = isset($parts['path']) ? str_replace('\\', '/', (string) $parts['path']) : '';
 
-            // normalize common wrong absolute paths
             $path = preg_replace('#^/api/storage/#i', '/storage/', $path);
             $path = preg_replace('#^/api/public/storage/#i', '/storage/', $path);
             $path = preg_replace('#^/storage/app/public/#i', '/storage/', $path);
@@ -116,12 +150,10 @@ class CounselorMessageController extends Controller
             return $this->unparseUrl($parts);
         }
 
-        // Scheme-relative URL
         if (str_starts_with($s, '//')) {
             return request()->getScheme() . ':' . $s;
         }
 
-        // Strip common Laravel prefixes
         $s = preg_replace('#^storage/app/public/#i', '', $s);
         $s = preg_replace('#^public/#i', '', $s);
 
@@ -135,7 +167,6 @@ class CounselorMessageController extends Controller
             $normalized = 'storage/' . $normalized;
         }
 
-        // normalize relative api/storage/* => storage/*
         $normalized = preg_replace('#^api/storage/#i', 'storage', $normalized);
 
         $finalPath = '/' . ltrim($normalized, '/');
@@ -143,17 +174,9 @@ class CounselorMessageController extends Controller
         return url($finalPath);
     }
 
-    /**
-     * GET /counselor/messages
-     *
-     * ✅ FIX (names):
-     * - Always return a resolved sender_name (fallback to joined users.name).
-     * - Always return a resolved recipient_name for counselor-sent threads:
-     *   recipient_u.name OR owner_u.name (covers legacy rows where recipient_id is null but user_id is the student).
-     */
     public function index(Request $request): JsonResponse
     {
-        $user = $request->user();
+        $user = $this->resolveUser($request);
 
         if (! $user) {
             return response()->json(['message' => 'Unauthenticated.'], 401);
@@ -163,12 +186,8 @@ class CounselorMessageController extends Controller
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
-        // Effective conversation id used in joins + response (covers any legacy nulls)
         $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
 
-        // ✅ Resolved sender_name:
-        // - system => "Guidance & Counseling Office" (unless sender_name already stored)
-        // - else   => messages.sender_name (if present) then sender user name then owner user name
         $resolvedSenderNameSql = "
             CASE
                 WHEN LOWER(COALESCE(messages.sender, '')) = 'system'
@@ -182,9 +201,6 @@ class CounselorMessageController extends Controller
             END
         ";
 
-        // ✅ Resolved recipient_name:
-        // For peer roles (student/guest/admin/referral_user), use recipient_u.name OR owner_u.name (legacy-safe)
-        // For counselor recipients, keep recipient_u.name only (avoid accidentally using owner_u which may be sender)
         $resolvedRecipientNameSql = "
             CASE
                 WHEN LOWER(COALESCE(messages.recipient_role, '')) IN ('student','guest','admin','referral_user','dean','registrar','program_chair')
@@ -194,7 +210,6 @@ class CounselorMessageController extends Controller
         ";
 
         $messages = Message::query()
-            // ✅ Join users for avatar + name lookup
             ->leftJoin('users as sender_u', 'messages.sender_id', '=', 'sender_u.id')
             ->leftJoin('users as recipient_u', 'messages.recipient_id', '=', 'recipient_u.id')
             ->leftJoin('users as owner_u', 'messages.user_id', '=', 'owner_u.id')
@@ -204,7 +219,6 @@ class CounselorMessageController extends Controller
                     ->where('mcd.user_id', '=', (int) $user->id);
             })
             ->where(function ($q) use ($user) {
-                // 1) Counselor inbox (direct or office): includes student/guest -> counselor messages
                 $q->where(function ($q2) use ($user) {
                     $q2->where('messages.recipient_role', 'counselor')
                         ->where(function ($q3) use ($user) {
@@ -212,20 +226,15 @@ class CounselorMessageController extends Controller
                                 ->orWhere('messages.recipient_id', $user->id);
                         });
                 })
-
-                // 2) All student threads (full conversation history)
                 ->orWhere(function ($q2) {
                     $q2->whereNotNull('messages.conversation_id')
                         ->where('messages.conversation_id', 'like', 'student-%');
                 })
-
-                // 3) Also include anything the current counselor sent (compatibility / sent-items)
                 ->orWhere(function ($q2) use ($user) {
                     $q2->where('messages.sender', 'counselor')
                         ->where('messages.sender_id', $user->id);
                 });
             })
-            // ✅ Hide conversations deleted by this counselor (unless message is newer than deletion timestamp)
             ->where(function ($q) {
                 $q->whereNull('mcd.deleted_at')
                     ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
@@ -245,19 +254,14 @@ class CounselorMessageController extends Controller
             ])
             ->selectRaw($effectiveConversationIdSql . ' as conversation_id')
             ->selectRaw('messages.counselor_is_read as is_read')
-
-            // ✅ Names
             ->selectRaw($resolvedSenderNameSql . ' as sender_name')
             ->selectRaw($resolvedRecipientNameSql . ' as recipient_name')
             ->selectRaw("NULLIF(owner_u.name, '') as user_name")
-
-            // ✅ Avatar fields for frontend (peerAvatarUrl)
             ->selectRaw("COALESCE(sender_u.avatar_url, owner_u.avatar_url) as sender_avatar_url")
             ->selectRaw("recipient_u.avatar_url as recipient_avatar_url")
             ->selectRaw("owner_u.avatar_url as user_avatar_url")
             ->get();
 
-        // ✅ Normalize avatar URLs to usable absolute URLs
         $messages->transform(function ($m) {
             $m->sender_avatar_url = $this->resolveAvatarUrl($m->sender_avatar_url ?? null);
             $m->recipient_avatar_url = $this->resolveAvatarUrl($m->recipient_avatar_url ?? null);
@@ -271,12 +275,9 @@ class CounselorMessageController extends Controller
         ]);
     }
 
-    /**
-     * POST /counselor/messages
-     */
     public function store(Request $request): JsonResponse
     {
-        $user = $request->user();
+        $user = $this->resolveUser($request);
 
         if (! $user) {
             return response()->json(['message' => 'Unauthenticated.'], 401);
@@ -288,11 +289,8 @@ class CounselorMessageController extends Controller
 
         $data = $request->validate([
             'content' => ['required', 'string'],
-            // ✅ allow admin (and keep existing list)
             'recipient_role' => ['nullable', 'in:student,guest,counselor,admin'],
             'recipient_id' => ['nullable', 'integer', 'exists:users,id'],
-
-            // Accept string OR integer conversation ids from the frontend
             'conversation_id' => [
                 'nullable',
                 function ($attribute, $value, $fail) {
@@ -311,7 +309,6 @@ class CounselorMessageController extends Controller
         $recipientRole = $data['recipient_role'] ?? 'counselor';
         $recipientId = isset($data['recipient_id']) ? (int) $data['recipient_id'] : null;
 
-        // Enforce recipient requirements
         if ($recipientRole !== 'counselor' && ! $recipientId) {
             return response()->json([
                 'message' => 'recipient_id is required for student/guest/admin recipients.',
@@ -320,7 +317,6 @@ class CounselorMessageController extends Controller
 
         $recipientUser = null;
 
-        // If sending to a specific user, ensure their role matches expected
         if ($recipientId) {
             $recipientUser = User::find($recipientId);
             if (! $recipientUser) {
@@ -348,7 +344,6 @@ class CounselorMessageController extends Controller
             }
         }
 
-        // Canonical conversation id
         $canonicalConversationId = $this->conversationIdFor(
             'counselor',
             (int) $user->id,
@@ -357,11 +352,6 @@ class CounselorMessageController extends Controller
             null
         );
 
-        $conversationHint = $data['conversation_id'] ?? null;
-        $conversationId = ((string) $conversationHint === $canonicalConversationId)
-            ? $canonicalConversationId
-            : $canonicalConversationId;
-
         $message = new Message();
         $message->sender = 'counselor';
         $message->sender_id = (int) $user->id;
@@ -369,18 +359,14 @@ class CounselorMessageController extends Controller
 
         $message->recipient_role = $recipientRole;
         $message->recipient_id = $recipientId;
-        $message->conversation_id = $conversationId;
+        $message->conversation_id = $canonicalConversationId;
 
         $message->content = $data['content'];
 
-        // Preserve legacy "user_id" meaning:
-        // - if sending to student/guest => user_id = recipient
-        // - otherwise => set to counselor sender
         $message->user_id = $recipientId && in_array($recipientRole, ['student', 'guest'], true)
             ? $recipientId
             : (int) $user->id;
 
-        // Read flags:
         if (in_array($recipientRole, ['student', 'guest'], true)) {
             $message->is_read = false;
             $message->student_read_at = null;
@@ -399,7 +385,6 @@ class CounselorMessageController extends Controller
 
         $message->save();
 
-        // ✅ include avatar URLs + names in response so UI updates immediately
         $senderAvatar = $this->resolveAvatarUrl($user->avatar_url ?? null);
         $recipientAvatar = $this->resolveAvatarUrl($recipientUser?->avatar_url ?? null);
 
@@ -417,8 +402,6 @@ class CounselorMessageController extends Controller
             'is_read' => (bool) $message->counselor_is_read,
             'created_at' => $message->created_at,
             'updated_at' => $message->updated_at,
-
-            // ✅ new fields used by frontend avatar picker
             'sender_avatar_url' => $senderAvatar,
             'recipient_avatar_url' => $recipientAvatar,
         ];
@@ -429,12 +412,9 @@ class CounselorMessageController extends Controller
         ], 201);
     }
 
-    /**
-     * POST /counselor/messages/mark-as-read
-     */
     public function markAsRead(Request $request): JsonResponse
     {
-        $user = $request->user();
+        $user = $this->resolveUser($request);
 
         if (! $user) {
             return response()->json(['message' => 'Unauthenticated.'], 401);
