@@ -26,6 +26,18 @@ class ReferralController extends Controller
 
         $role = strtolower((string) ($user->role ?? ''));
 
+        // ✅ FIX: allow explicit referral_user role
+        if (
+            $role === 'referral_user' ||
+            $role === 'referral-user' ||
+            $role === 'referral user' ||
+            str_contains($role, 'referral_user') ||
+            str_contains($role, 'referral-user')
+        ) {
+            return true;
+        }
+
+        // existing role variants (Dean/Registrar/Program Chair)
         return str_contains($role, 'dean')
             || str_contains($role, 'registrar')
             || str_contains($role, 'program chair')
@@ -49,7 +61,6 @@ class ReferralController extends Controller
             }
         }
 
-        // Ensure id is present for relationship mapping.
         if (! in_array('id', $cols, true)) {
             array_unshift($cols, 'id');
         }
@@ -59,11 +70,9 @@ class ReferralController extends Controller
 
     private function referralWith(): array
     {
-        // Student: include extra columns only if they exist.
         $studentExtras = ['student_id', 'program', 'course', 'year_level'];
         $studentCols = $this->userSelectColumns($studentExtras);
 
-        // RequestedBy/Counselor: keep minimal.
         $miniCols = $this->userSelectColumns([]);
 
         return [
@@ -74,8 +83,37 @@ class ReferralController extends Controller
     }
 
     /**
+     * Resolve student by:
+     * 1) users.student_id (primary)
+     * 2) users.id (fallback if numeric)
+     */
+    private function resolveStudentFromKey(string $studentKey): ?User
+    {
+        $studentKey = trim((string) $studentKey);
+
+        if ($studentKey === '') {
+            return null;
+        }
+
+        return User::query()
+            ->where(function ($q) use ($studentKey) {
+                $q->where('student_id', $studentKey);
+
+                if (ctype_digit($studentKey)) {
+                    $q->orWhere('id', (int) $studentKey);
+                }
+            })
+            ->first();
+    }
+
+    private function isStudent(User $u): bool
+    {
+        $studentRole = strtolower((string) ($u->role ?? ''));
+        return str_contains($studentRole, 'student');
+    }
+
+    /**
      * POST /referral-user/referrals
-     * Create referral request (Dean/Registrar/Program Chair)
      */
     public function store(Request $request): JsonResponse
     {
@@ -90,23 +128,26 @@ class ReferralController extends Controller
         }
 
         $data = $request->validate([
-            'student_id'   => ['required', 'integer', 'exists:users,id'],
+            'student_id'   => ['required', 'string', 'max:100'],
             'concern_type' => ['required', 'string', 'max:255'],
             'urgency'      => ['required', 'in:low,medium,high'],
             'details'      => ['required', 'string'],
         ]);
 
-        $student = User::find((int) $data['student_id']);
+        $student = $this->resolveStudentFromKey((string) $data['student_id']);
+
         if (! $student) {
-            return response()->json(['message' => 'Student not found.'], 404);
+            return response()->json([
+                'message' => 'Student not found. Please check the Student ID (users.student_id).',
+            ], 404);
         }
 
-        $studentRole = strtolower((string) ($student->role ?? ''));
-        if (! str_contains($studentRole, 'student')) {
+        if (! $this->isStudent($student)) {
             return response()->json(['message' => 'Selected user is not a student.'], 422);
         }
 
         $ref = new Referral();
+        // ✅ DB stores internal users.id as FK on referrals.student_id
         $ref->student_id = (int) $student->id;
         $ref->requested_by_id = (int) $actor->id;
 
@@ -130,7 +171,6 @@ class ReferralController extends Controller
 
     /**
      * GET /counselor/referrals
-     * Counselor list referrals (with pagination)
      */
     public function counselorIndex(Request $request): JsonResponse
     {
@@ -169,7 +209,6 @@ class ReferralController extends Controller
                 ],
             ]);
         } catch (Throwable $e) {
-            // If APP_DEBUG=true you'll see the real issue in laravel.log.
             return response()->json([
                 'message' => 'Failed to fetch referrals.',
                 'error' => $e->getMessage(),
@@ -179,7 +218,6 @@ class ReferralController extends Controller
 
     /**
      * GET /referral-user/referrals
-     * Referral user list only their referrals
      */
     public function referralUserIndex(Request $request): JsonResponse
     {
@@ -220,8 +258,7 @@ class ReferralController extends Controller
     }
 
     /**
-     * GET /counselor/referrals/{id}
-     * GET /referral-user/referrals/{id}
+     * GET /counselor/referrals/{id} OR /referral-user/referrals/{id}
      */
     public function show(Request $request, int $id): JsonResponse
     {
@@ -262,7 +299,6 @@ class ReferralController extends Controller
 
     /**
      * PATCH /counselor/referrals/{id}
-     * Counselor updates status + optional remarks + optional counselor assignment
      */
     public function update(Request $request, int $id): JsonResponse
     {
@@ -336,6 +372,138 @@ class ReferralController extends Controller
         } catch (Throwable $e) {
             return response()->json([
                 'message' => 'Failed to update referral.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * ✅ PATCH/PUT /referral-user/referrals/{id}
+     * Referral-user can edit ONLY their own referral, and ONLY while pending.
+     * (status changes remain counselor-only)
+     */
+    public function referralUserUpdate(Request $request, int $id): JsonResponse
+    {
+        $actor = $request->user();
+
+        if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
+        if (! $this->isReferralUser($actor)) return response()->json(['message' => 'Forbidden.'], 403);
+
+        try {
+            $ref = Referral::query()
+                ->where('id', (int) $id)
+                ->where('requested_by_id', (int) $actor->id)
+                ->first();
+
+            if (! $ref) {
+                return response()->json(['message' => 'Referral not found.'], 404);
+            }
+
+            $currentStatus = strtolower((string) ($ref->status ?? 'pending'));
+            if ($currentStatus !== 'pending') {
+                return response()->json([
+                    'message' => 'Only pending referrals can be edited.',
+                ], 422);
+            }
+
+            $data = $request->validate([
+                'student_id'   => ['nullable', 'string', 'max:100'],
+                'concern_type' => ['nullable', 'string', 'max:255'],
+                'urgency'      => ['nullable', 'in:low,medium,high'],
+                'details'      => ['nullable', 'string'],
+            ]);
+
+            $hasAny =
+                array_key_exists('student_id', $data) ||
+                array_key_exists('concern_type', $data) ||
+                array_key_exists('urgency', $data) ||
+                array_key_exists('details', $data);
+
+            if (! $hasAny) {
+                return response()->json([
+                    'message' => 'No fields provided to update.',
+                ], 422);
+            }
+
+            if (array_key_exists('student_id', $data) && $data['student_id'] !== null) {
+                $student = $this->resolveStudentFromKey((string) $data['student_id']);
+
+                if (! $student) {
+                    return response()->json([
+                        'message' => 'Student not found. Please check the Student ID (users.student_id).',
+                    ], 404);
+                }
+
+                if (! $this->isStudent($student)) {
+                    return response()->json(['message' => 'Selected user is not a student.'], 422);
+                }
+
+                $ref->student_id = (int) $student->id;
+            }
+
+            if (array_key_exists('concern_type', $data) && $data['concern_type'] !== null) {
+                $ref->concern_type = $data['concern_type'];
+            }
+
+            if (array_key_exists('urgency', $data) && $data['urgency'] !== null) {
+                $ref->urgency = $data['urgency'];
+            }
+
+            if (array_key_exists('details', $data) && $data['details'] !== null) {
+                $ref->details = $data['details'];
+            }
+
+            $ref->save();
+            $ref->load($this->referralWith());
+
+            return response()->json([
+                'message'  => 'Referral updated.',
+                'referral' => $ref,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to update referral.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * ✅ DELETE /referral-user/referrals/{id}
+     * Referral-user can delete ONLY their own referral, and ONLY while pending.
+     */
+    public function referralUserDestroy(Request $request, int $id): JsonResponse
+    {
+        $actor = $request->user();
+
+        if (! $actor) return response()->json(['message' => 'Unauthenticated.'], 401);
+        if (! $this->isReferralUser($actor)) return response()->json(['message' => 'Forbidden.'], 403);
+
+        try {
+            $ref = Referral::query()
+                ->where('id', (int) $id)
+                ->where('requested_by_id', (int) $actor->id)
+                ->first();
+
+            if (! $ref) {
+                return response()->json(['message' => 'Referral not found.'], 404);
+            }
+
+            $currentStatus = strtolower((string) ($ref->status ?? 'pending'));
+            if ($currentStatus !== 'pending') {
+                return response()->json([
+                    'message' => 'Only pending referrals can be deleted.',
+                ], 422);
+            }
+
+            $ref->delete();
+
+            return response()->json([
+                'message' => 'Referral deleted.',
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to delete referral.',
                 'error' => $e->getMessage(),
             ], 500);
         }

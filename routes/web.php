@@ -106,10 +106,6 @@ Route::prefix('auth')->group(function () {
 |--------------------------------------------------------------------------|
 | ✅ Notification counts endpoint (badges)
 |--------------------------------------------------------------------------|
-| IMPORTANT FIX:
-| - DO NOT put this behind auth middleware, because the route middleware
-|   will return 401 BEFORE your controller can return 200 with zeros.
-| - Controller already returns 200 with zeros if unauthenticated.
 */
 Route::get('notifications/counts', [NotificationController::class, 'counts'])
     ->name('notifications.counts');
@@ -118,10 +114,6 @@ Route::get('notifications/counts', [NotificationController::class, 'counts'])
 |--------------------------------------------------------------------------|
 | ✅ FIX: Message update/delete endpoints (for editing messages)
 |--------------------------------------------------------------------------|
-| Frontend calls:
-| - PATCH /messages/{id}
-| - PUT   /messages/{id}
-| - DELETE /messages/{id}
 */
 Route::middleware(AuthenticateAnyGuard::class)->match(['PATCH', 'PUT'], 'messages/{id}', [MessageController::class, 'update'])
     ->whereNumber('id')
@@ -135,13 +127,6 @@ Route::middleware(AuthenticateAnyGuard::class)->delete('messages/{id}', [Message
 |--------------------------------------------------------------------------|
 | ✅ Conversation delete endpoints (persist delete across refresh)
 |--------------------------------------------------------------------------|
-|
-| Frontend tries these candidates:
-| - DELETE /messages/conversations/{conversationId}
-| - DELETE /conversations/{conversationId}
-| - DELETE /messages/thread/{conversationId}
-|
-| We implement all 3 and "delete" means: hide for the current user only.
 */
 Route::middleware(AuthenticateAnyGuard::class)->delete('messages/conversations/{conversationId}', [MessageConversationController::class, 'destroy'])
     ->where('conversationId', '.+')
@@ -339,8 +324,6 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('counselor')->group(funct
 |--------------------------------------------------------------------------|
 | ✅ Referral User endpoints (Dean/Registrar/Program Chair)
 |--------------------------------------------------------------------------|
-| They can create referrals + view their own referral history.
-| ✅ PLUS: referral-user messages endpoints (FIX 404 + privacy)
 */
 Route::middleware(AuthenticateAnyGuard::class)->prefix('referral-user')->group(function () {
     Route::post('referrals', [ReferralController::class, 'store'])
@@ -352,6 +335,32 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('referral-user')->group(f
     Route::get('referrals/{id}', [ReferralController::class, 'show'])
         ->whereNumber('id')
         ->name('referral_user.referrals.show');
+
+    // ✅ FIX: Enable Referral-User CRUD routes (PATCH/PUT + DELETE) to avoid 405 Method Not Allowed
+    Route::match(['PATCH', 'PUT'], 'referrals/{id}', [ReferralController::class, 'referralUserUpdate'])
+        ->whereNumber('id')
+        ->name('referral_user.referrals.update');
+
+    Route::delete('referrals/{id}', [ReferralController::class, 'referralUserDestroy'])
+        ->whereNumber('id')
+        ->name('referral_user.referrals.destroy');
+
+    /*
+    |--------------------------------------------------------------------------|
+    | ✅ FIX: Referral-user student directory endpoints to stop 404s
+    | Frontend tries:
+    | - GET /referral-user/students?search=
+    | - GET /referral-user/users?role=student&search=
+    |--------------------------------------------------------------------------|
+    */
+    Route::get('students', function (Request $request) {
+        return directoryResponse($request, 'student');
+    })->name('referral_user.directory.students');
+
+    Route::get('users', function (Request $request) {
+        // We only allow referral-user to list students (even if role query param is passed).
+        return directoryResponse($request, 'student');
+    })->name('referral_user.directory.users');
 
     // ✅ Referral user messages
     Route::get('messages', [ReferralUserMessageController::class, 'index'])
@@ -383,16 +392,33 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
     if (! $actor) return false;
 
     $actorRole = strtolower((string) ($actor->role ?? ''));
+
     $isCounselor = str_contains($actorRole, 'counselor')
         || str_contains($actorRole, 'counsellor')
         || str_contains($actorRole, 'guidance');
 
     $isAdmin = str_contains($actorRole, 'admin');
 
+    // ✅ FIX: referral-user (Dean/Registrar/Program Chair/referral_user) must be able to list students for referrals
+    $isReferralUser =
+        $actorRole === 'referral_user' ||
+        $actorRole === 'referral-user' ||
+        $actorRole === 'referral user' ||
+        str_contains($actorRole, 'referral_user') ||
+        str_contains($actorRole, 'referral-user') ||
+        str_contains($actorRole, 'dean') ||
+        str_contains($actorRole, 'registrar') ||
+        str_contains($actorRole, 'program chair') ||
+        str_contains($actorRole, 'program_chair') ||
+        str_contains($actorRole, 'programchair');
+
     $target = strtolower(trim($targetRole));
 
     // ✅ Anyone authenticated may list counselors (needed by StudentMessages.tsx)
     if ($target === 'counselor') return true;
+
+    // ✅ FIX: allow referral-user to list STUDENTS only
+    if ($target === 'student') return $isCounselor || $isAdmin || $isReferralUser;
 
     // ✅ Only counselor/admin can list other roles
     return $isCounselor || $isAdmin;
@@ -645,6 +671,11 @@ function directoryResponse(Request $request, string $role)
     ]);
 }
 
+/*
+|--------------------------------------------------------------------------|
+| ✅ Directory routes
+|--------------------------------------------------------------------------|
+*/
 Route::middleware(AuthenticateAnyGuard::class)->get('students', function (Request $request) {
     return directoryResponse($request, 'student');
 });
@@ -676,6 +707,37 @@ Route::middleware(AuthenticateAnyGuard::class)->get('users', function (Request $
 
     return directoryResponseMulti($request, $roles);
 });
+
+/*
+|--------------------------------------------------------------------------|
+| ✅ FIX: Alias routes to stop 404 + CORS issues from older frontend calls
+| Frontend previously tried:
+| - /students/search?q=
+| - /users/search?role=student&q=
+| - /search/users?role=student&q=
+|--------------------------------------------------------------------------|
+*/
+Route::middleware(AuthenticateAnyGuard::class)->get('students/search', function (Request $request) {
+    return directoryResponse($request, 'student');
+})->name('students.search.alias');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('users/search', function (Request $request) {
+    $roles = directoryNormalizeRolesFromRequest($request);
+    if (count($roles) === 0) $roles = ['student'];
+
+    if (count($roles) === 1) return directoryResponse($request, $roles[0]);
+
+    return directoryResponseMulti($request, $roles);
+})->name('users.search.alias');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('search/users', function (Request $request) {
+    $roles = directoryNormalizeRolesFromRequest($request);
+    if (count($roles) === 0) $roles = ['student'];
+
+    if (count($roles) === 1) return directoryResponse($request, $roles[0]);
+
+    return directoryResponseMulti($request, $roles);
+})->name('search.users.alias');
 
 /*
 |--------------------------------------------------------------------------|

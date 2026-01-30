@@ -18,11 +18,14 @@ return [
         'counselor/*',
         'admin/*',
 
-        // ✅ FIX: referral-user APIs (this was missing => no CORS headers => browser blocks)
+        // ✅ referral-user APIs
         'referral-user',
         'referral-user/*',
 
-        // ✅ FIX: notifications endpoint (badges)
+        // ✅ FIX: add search alias paths (so /search/users won't be blocked by browser)
+        'search/*',
+
+        // ✅ notifications endpoint (badges)
         'notifications',
         'notifications/*',
 
