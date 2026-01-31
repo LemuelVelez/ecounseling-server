@@ -18,6 +18,8 @@ class ReferralUserMessageController extends Controller
         $role = strtolower((string) ($user->role ?? ''));
 
         return str_contains($role, 'referral_user')
+            || str_contains($role, 'referral-user')
+            || str_contains($role, 'referral user')
             || str_contains($role, 'dean')
             || str_contains($role, 'registrar')
             || str_contains($role, 'program chair')
@@ -40,36 +42,90 @@ class ReferralUserMessageController extends Controller
     private function isCounselorSenderValue(?string $sender): bool
     {
         $s = strtolower(trim((string) $sender));
-        return $s === 'counselor' || str_contains($s, 'counselor') || str_contains($s, 'counsellor') || str_contains($s, 'guidance');
+        return $s === 'counselor'
+            || str_contains($s, 'counselor')
+            || str_contains($s, 'counsellor')
+            || str_contains($s, 'guidance');
     }
 
     /**
-     * Canonical conversation id for referral_user <-> counselor
+     * ✅ Referral-user role variants seen in older data.
+     */
+    private function normalizeRecipientRole(?string $role): string
+    {
+        $r = strtolower(trim((string) $role));
+        if ($r === '') return '';
+
+        if (in_array($r, [
+            'referral_user',
+            'referral-user',
+            'referral user',
+            'dean',
+            'registrar',
+            'program_chair',
+            'program chair',
+            'programchair',
+        ], true)) {
+            return 'referral_user';
+        }
+
+        return $r;
+    }
+
+    /**
+     * ✅ Canonical conversation id for referral_user <-> counselor
+     * This MUST be stable so replies never create a "new thread".
      */
     private function conversationIdFor(int $referralUserId, int $counselorId): string
     {
         return "referral_user-{$referralUserId}-counselor-{$counselorId}";
     }
 
+    /**
+     * ✅ Only treat a stored conversation_id as canonical if it matches:
+     *    referral_user-{refId}-counselor-{counselorId}
+     *
+     * This prevents legacy values like "referral_user-5" from splitting threads.
+     */
+    private function isCanonicalConversationId(?string $conversationId): bool
+    {
+        $s = trim((string) $conversationId);
+        if ($s === '') return false;
+
+        return (bool) preg_match('/^referral_user-\d+-counselor-\d+$/', $s);
+    }
+
+    /**
+     * Compute the canonical conversation id for ANY message in this module,
+     * even if older rows have NULL/empty/legacy conversation_id.
+     */
     private function conversationKey(Message $m): string
     {
         $raw = $m->conversation_id ?? null;
-        if ($raw !== null && trim((string) $raw) !== '') return (string) $raw;
 
-        // Best-effort canonical fallback if conversation_id is missing:
+        // ✅ Accept only canonical stored ids; ignore legacy ids to prevent splitting.
+        if ($raw !== null) {
+            $rawStr = trim((string) $raw);
+            if ($this->isCanonicalConversationId($rawStr)) {
+                return $rawStr;
+            }
+        }
+
         $sender = strtolower(trim((string) ($m->sender ?? '')));
 
         $senderId = (int) ($m->sender_id ?? 0);
         $recipientId = (int) ($m->recipient_id ?? 0);
-        $recipientRole = strtolower(trim((string) ($m->recipient_role ?? '')));
+
+        $recipientRole = $this->normalizeRecipientRole($m->recipient_role ?? '');
 
         // referral_user -> counselor
         if ($sender === 'referral_user' && $recipientRole === 'counselor' && $senderId > 0 && $recipientId > 0) {
             return $this->conversationIdFor($senderId, $recipientId);
         }
 
-        // counselor -> referral_user
+        // counselor -> referral_user (and legacy counselor sender variants)
         if ($this->isCounselorSenderValue($sender) && $recipientRole === 'referral_user' && $senderId > 0 && $recipientId > 0) {
+            // NOTE: recipient_id is referral user, sender_id is counselor
             return $this->conversationIdFor($recipientId, $senderId);
         }
 
@@ -102,6 +158,13 @@ class ReferralUserMessageController extends Controller
         }
 
         $dto = $m->toArray();
+
+        /**
+         * ✅ CRITICAL FIX:
+         * Always return a stable, canonical conversation_id so the frontend never splits threads.
+         * This also "repairs" legacy rows that stored "referral_user-{id}".
+         */
+        $dto['conversation_id'] = $this->conversationKey($m);
 
         $dto['sender_name'] = $senderName;
 
@@ -142,10 +205,20 @@ class ReferralUserMessageController extends Controller
             ->get(['conversation_id', 'deleted_at']);
 
         $deletedAtByConversation = [];
+        $legacyPrefixes = [];
+
         foreach ($deletions as $d) {
             $key = trim((string) ($d->conversation_id ?? ''));
             if ($key === '') continue;
+
             $deletedAtByConversation[$key] = $d->deleted_at;
+
+            // ✅ Backward compatibility:
+            // If a deletion was stored as "referral_user-{id}", treat it as a prefix for:
+            // "referral_user-{id}-counselor-{counselorId}"
+            if (preg_match('/^referral_user-\d+$/', $key)) {
+                $legacyPrefixes[$key] = $d->deleted_at;
+            }
         }
 
         $messages = Message::query()
@@ -162,26 +235,46 @@ class ReferralUserMessageController extends Controller
                 })
                 // (B) Sent by counselor -> this referral user only
                 ->orWhere(function ($q2) use ($user) {
-                    $q2->where('recipient_role', 'referral_user')
-                        ->where('recipient_id', (int) $user->id)
-                        ->where(function ($q3) {
-                            $q3->where('sender', 'counselor')
-                               ->orWhereRaw('LOWER(sender) LIKE ?', ['%counselor%'])
-                               ->orWhereRaw('LOWER(sender) LIKE ?', ['%counsellor%'])
-                               ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%']);
-                        });
+                    // be robust to older recipient_role variants
+                    $q2->where(function ($rr) {
+                        $rr->where('recipient_role', 'referral_user')
+                           ->orWhere('recipient_role', 'referral-user')
+                           ->orWhere('recipient_role', 'referral user')
+                           ->orWhere('recipient_role', 'dean')
+                           ->orWhere('recipient_role', 'registrar')
+                           ->orWhere('recipient_role', 'program_chair')
+                           ->orWhere('recipient_role', 'program chair')
+                           ->orWhere('recipient_role', 'programchair');
+                    })
+                    ->where('recipient_id', (int) $user->id)
+                    ->where(function ($q3) {
+                        $q3->where('sender', 'counselor')
+                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%counselor%'])
+                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%counsellor%'])
+                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%']);
+                    });
                 });
             })
             ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
 
-        $visible = $messages->filter(function (Message $m) use ($deletedAtByConversation) {
+        $visible = $messages->filter(function (Message $m) use ($deletedAtByConversation, $legacyPrefixes) {
             $key = $this->conversationKey($m);
 
-            if (! array_key_exists($key, $deletedAtByConversation)) return true;
-
+            // exact match (canonical)
             $cutoff = $deletedAtByConversation[$key] ?? null;
+
+            // prefix match (legacy deletion key: referral_user-{id})
+            if (! $cutoff && count($legacyPrefixes) > 0) {
+                foreach ($legacyPrefixes as $prefix => $dt) {
+                    if (str_starts_with($key, $prefix . '-')) {
+                        $cutoff = $dt;
+                        break;
+                    }
+                }
+            }
+
             if (! $cutoff) return true;
 
             $createdAt = $m->created_at instanceof Carbon
@@ -211,6 +304,14 @@ class ReferralUserMessageController extends Controller
         $data = $request->validate([
             'content' => ['required', 'string', 'max:5000'],
             'recipient_id' => ['required', 'integer', 'exists:users,id'],
+
+            /**
+             * ✅ IMPORTANT FIX:
+             * We allow the client to send conversation_id, but we DO NOT reject it anymore.
+             * Older UIs may send legacy ids (e.g., "referral_user-{id}") which caused 422.
+             * The server always computes and stores the canonical id anyway.
+             */
+            'conversation_id' => ['nullable', 'string', 'max:255'],
         ]);
 
         $counselorId = (int) $data['recipient_id'];
@@ -232,7 +333,9 @@ class ReferralUserMessageController extends Controller
         $m->recipient_role = 'counselor';
         $m->recipient_id = $counselorId;
 
+        // ✅ Always store canonical
         $m->conversation_id = $conversationId;
+
         $m->content = (string) $data['content'];
 
         // referral user already read their outgoing
@@ -273,7 +376,16 @@ class ReferralUserMessageController extends Controller
         ]);
 
         $q = Message::query()
-            ->where('recipient_role', 'referral_user')
+            ->where(function ($rr) {
+                $rr->where('recipient_role', 'referral_user')
+                   ->orWhere('recipient_role', 'referral-user')
+                   ->orWhere('recipient_role', 'referral user')
+                   ->orWhere('recipient_role', 'dean')
+                   ->orWhere('recipient_role', 'registrar')
+                   ->orWhere('recipient_role', 'program_chair')
+                   ->orWhere('recipient_role', 'program chair')
+                   ->orWhere('recipient_role', 'programchair');
+            })
             ->where('recipient_id', (int) $user->id)
             ->where('is_read', false);
 
