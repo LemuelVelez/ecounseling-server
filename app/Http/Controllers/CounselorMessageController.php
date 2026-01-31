@@ -22,6 +22,29 @@ class CounselorMessageController extends Controller
             || str_contains($role, 'guidance');
     }
 
+    private function isReferralUserRoleString(string $role): bool
+    {
+        $r = strtolower(trim($role));
+        if ($r === '') return false;
+
+        return $r === 'referral_user'
+            || $r === 'referral-user'
+            || $r === 'referral user'
+            || str_contains($r, 'referral_user')
+            || str_contains($r, 'referral-user')
+            || str_contains($r, 'dean')
+            || str_contains($r, 'registrar')
+            || str_contains($r, 'program_chair')
+            || str_contains($r, 'program chair')
+            || str_contains($r, 'programchair');
+    }
+
+    private function isReferralUser(?User $user): bool
+    {
+        if (! $user) return false;
+        return $this->isReferralUserRoleString((string) ($user->role ?? ''));
+    }
+
     /**
      * ✅ Resolve authenticated user across possible guards (web/session OR api/sanctum token).
      * This prevents 401 caused by "wrong guard" when the SPA uses Authorization: Bearer.
@@ -34,32 +57,38 @@ class CounselorMessageController extends Controller
         try {
             $u = $request->user('web');
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         try {
             $u = $request->user('api');
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         try {
             $u = $request->user('sanctum');
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         try {
             $u = Auth::guard('web')->user();
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         try {
             $u = Auth::guard('api')->user();
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         try {
             $u = Auth::guard('sanctum')->user();
             if ($u instanceof User) return $u;
-        } catch (\Throwable $e) {}
+        } catch (\Throwable $e) {
+        }
 
         return null;
     }
@@ -71,6 +100,8 @@ class CounselorMessageController extends Controller
         ?int $recipientId,
         ?int $studentOwnerId = null
     ): string {
+        $recipientRole = strtolower(trim($recipientRole));
+
         // Student/guest thread: keep stable thread id per student/guest owner
         if (($recipientRole === 'student' || $recipientRole === 'guest') && $recipientId) {
             return "student-{$recipientId}";
@@ -85,7 +116,12 @@ class CounselorMessageController extends Controller
             return "admin-{$recipientId}";
         }
 
-        // Counselor-to-counselor direct thread
+        // ✅ Referral-user direct thread (Dean/Registrar/Program Chair)
+        if ($recipientRole === 'referral_user' && $recipientId) {
+            return "referral_user-{$recipientId}";
+        }
+
+        // Counselor-to-counselor direct thread (stable symmetric key)
         if ($recipientRole === 'counselor' && $senderId && $recipientId) {
             $a = min($senderId, $recipientId);
             $b = max($senderId, $recipientId);
@@ -186,7 +222,65 @@ class CounselorMessageController extends Controller
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
-        $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
+        /**
+         * ✅ FIX (duplicate threads):
+         * Treat legacy/unstable conversation_id values (e.g., numeric ids, random ids, "general")
+         * as NOT canonical. Always return a canonical id based on role + participant ids:
+         * - student-{studentId}
+         * - admin-{adminId}
+         * - referral_user-{id}
+         * - counselor-{minId}-{maxId}
+         * - counselor-office
+         */
+        $effectiveConversationIdSql = "
+            CASE
+                WHEN NULLIF(COALESCE(messages.conversation_id, ''), '') IS NOT NULL
+                    AND LOWER(COALESCE(messages.conversation_id, '')) <> 'general'
+                    AND (
+                        LOWER(COALESCE(messages.conversation_id, '')) LIKE 'student-%'
+                        OR LOWER(COALESCE(messages.conversation_id, '')) LIKE 'admin-%'
+                        OR LOWER(COALESCE(messages.conversation_id, '')) LIKE 'referral_user-%'
+                        OR LOWER(COALESCE(messages.conversation_id, '')) LIKE 'counselor-%'
+                        OR LOWER(COALESCE(messages.conversation_id, '')) = 'counselor-office'
+                    )
+                    THEN messages.conversation_id
+
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) IN ('student','guest')
+                    AND messages.recipient_id IS NOT NULL
+                    THEN CONCAT('student-', messages.recipient_id)
+
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) = 'admin'
+                    AND messages.recipient_id IS NOT NULL
+                    THEN CONCAT('admin-', messages.recipient_id)
+
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) IN ('referral_user','dean','registrar','program_chair')
+                    AND messages.recipient_id IS NOT NULL
+                    THEN CONCAT('referral_user-', messages.recipient_id)
+
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) = 'counselor'
+                    AND messages.recipient_id IS NOT NULL
+                    AND messages.sender_id IS NOT NULL
+                    THEN CONCAT('counselor-', LEAST(messages.sender_id, messages.recipient_id), '-', GREATEST(messages.sender_id, messages.recipient_id))
+
+                WHEN LOWER(COALESCE(messages.recipient_role, '')) = 'counselor'
+                    AND messages.recipient_id IS NULL
+                    THEN 'counselor-office'
+
+                WHEN LOWER(COALESCE(messages.sender, '')) IN ('referral_user','dean','registrar','program_chair')
+                    AND messages.sender_id IS NOT NULL
+                    THEN CONCAT('referral_user-', messages.sender_id)
+
+                WHEN LOWER(COALESCE(messages.sender, '')) = 'admin'
+                    AND messages.sender_id IS NOT NULL
+                    THEN CONCAT('admin-', messages.sender_id)
+
+                WHEN LOWER(COALESCE(messages.sender, '')) IN ('student','guest')
+                    AND messages.user_id IS NOT NULL
+                    THEN CONCAT('student-', messages.user_id)
+
+                ELSE CONCAT('student-', COALESCE(messages.user_id, 0))
+            END
+        ";
 
         $resolvedSenderNameSql = "
             CASE
@@ -289,7 +383,10 @@ class CounselorMessageController extends Controller
 
         $data = $request->validate([
             'content' => ['required', 'string'],
-            'recipient_role' => ['nullable', 'in:student,guest,counselor,admin'],
+
+            // ✅ allow referral_user (and legacy office role names)
+            'recipient_role' => ['nullable', 'in:student,guest,counselor,admin,referral_user,referral-user,referral user,dean,registrar,program_chair'],
+
             'recipient_id' => ['nullable', 'integer', 'exists:users,id'],
             'conversation_id' => [
                 'nullable',
@@ -306,12 +403,19 @@ class CounselorMessageController extends Controller
             ],
         ]);
 
-        $recipientRole = $data['recipient_role'] ?? 'counselor';
+        $recipientRoleRaw = strtolower(trim((string) ($data['recipient_role'] ?? 'counselor')));
         $recipientId = isset($data['recipient_id']) ? (int) $data['recipient_id'] : null;
+
+        // Normalize any office variants to canonical "referral_user"
+        if (in_array($recipientRoleRaw, ['referral-user', 'referral user', 'dean', 'registrar', 'program_chair', 'program chair', 'programchair'], true)) {
+            $recipientRoleRaw = 'referral_user';
+        }
+
+        $recipientRole = $recipientRoleRaw ?: 'counselor';
 
         if ($recipientRole !== 'counselor' && ! $recipientId) {
             return response()->json([
-                'message' => 'recipient_id is required for student/guest/admin recipients.',
+                'message' => 'recipient_id is required for student/guest/admin/referral_user recipients.',
             ], 422);
         }
 
@@ -342,6 +446,10 @@ class CounselorMessageController extends Controller
             if ($recipientRole === 'admin' && ! str_contains($targetRole, 'admin')) {
                 return response()->json(['message' => 'Recipient is not an admin.'], 422);
             }
+
+            if ($recipientRole === 'referral_user' && ! $this->isReferralUser($recipientUser)) {
+                return response()->json(['message' => 'Recipient is not a referral user.'], 422);
+            }
         }
 
         $canonicalConversationId = $this->conversationIdFor(
@@ -363,18 +471,21 @@ class CounselorMessageController extends Controller
 
         $message->content = $data['content'];
 
+        // Keep legacy behavior for student/guest owner; otherwise owner is the counselor (sender).
         $message->user_id = $recipientId && in_array($recipientRole, ['student', 'guest'], true)
             ? $recipientId
             : (int) $user->id;
 
-        if (in_array($recipientRole, ['student', 'guest'], true)) {
-            $message->is_read = false;
-            $message->student_read_at = null;
-        } else {
+        // is_read = "read by NON-counselor recipient"
+        if ($recipientRole === 'counselor') {
             $message->is_read = true;
             $message->student_read_at = now();
+        } else {
+            $message->is_read = false;
+            $message->student_read_at = null;
         }
 
+        // counselor read state
         if ($recipientRole === 'counselor') {
             $message->counselor_is_read = false;
             $message->counselor_read_at = null;
