@@ -25,9 +25,68 @@ class MessageController extends Controller
     }
 
     /**
+     * Normalize role strings into stable canonical values.
+     */
+    private function normalizeRole(?string $role): string
+    {
+        $r = strtolower(trim((string) $role));
+        $r = str_replace([' ', '-'], ['_', '_'], $r);
+
+        if ($r === '') return '';
+
+        if (str_contains($r, 'counselor') || str_contains($r, 'counsellor')) return 'counselor';
+        if (str_contains($r, 'admin')) return 'admin';
+        if (str_contains($r, 'student')) return 'student';
+        if (str_contains($r, 'guest')) return 'guest';
+
+        if ($r === 'referral_user' || $r === 'referraluser' || $r === 'referral') return 'referral_user';
+        if ($r === 'system') return 'system';
+
+        return $r;
+    }
+
+    /**
+     * SQL expression that produces a CANONICAL conversation id across legacy thread ids.
+     *
+     * ✅ Goal:
+     * - If a message involves a student/guest -> canonical "student-{id}"
+     * - If a message involves a referral_user -> canonical "referral-user-{id}"
+     * - Otherwise -> use existing conversation_id (or fallback to "msg-{id}")
+     *
+     * This prevents duplicate threads caused by inconsistent conversation_id values between senders.
+     *
+     * Note: Uses CONCAT/LOWER/REPLACE/COALESCE/NULLIF which work on MySQL and PostgreSQL.
+     */
+    private function canonicalConversationExpr(string $alias = 'messages'): string
+    {
+        $t = $alias;
+
+        return "
+            CASE
+                WHEN LOWER({$t}.sender) IN ('student','guest') AND {$t}.sender_id IS NOT NULL
+                    THEN CONCAT('student-', {$t}.sender_id)
+                WHEN LOWER({$t}.recipient_role) IN ('student','guest') AND {$t}.recipient_id IS NOT NULL
+                    THEN CONCAT('student-', {$t}.recipient_id)
+
+                WHEN LOWER(REPLACE({$t}.sender,'-','_')) = 'referral_user' AND {$t}.sender_id IS NOT NULL
+                    THEN CONCAT('referral-user-', {$t}.sender_id)
+                WHEN LOWER(REPLACE({$t}.recipient_role,'-','_')) = 'referral_user' AND {$t}.recipient_id IS NOT NULL
+                    THEN CONCAT('referral-user-', {$t}.recipient_id)
+
+                ELSE COALESCE(NULLIF({$t}.conversation_id,''), CONCAT('msg-', {$t}.id))
+            END
+        ";
+    }
+
+    /**
      * GET /admin/messages
-     * List conversations (one row per conversation_id) using the latest message.
+     * List conversations (one row per CANONICAL conversation id) using the latest message.
      * Respects per-user conversation deletions (hides if last message is not newer than deleted_at).
+     *
+     * ✅ FIXED:
+     * - Groups by CANONICAL conversation id (not raw messages.conversation_id) to prevent duplicates.
+     * - Joins deletions using the canonical id so hide/delete remains consistent.
+     * - Normalizes sender/recipient_role in response payload.
      */
     public function index(Request $request): JsonResponse
     {
@@ -43,10 +102,12 @@ class MessageController extends Controller
 
         $search = trim((string) $request->query('search', $request->query('q', $request->query('query', ''))));
 
-        // Latest message id per conversation_id (portable across PG/MySQL)
+        $expr = $this->canonicalConversationExpr('messages');
+
+        // Latest message id per CANONICAL conversation id
         $latestPerConversation = Message::query()
-            ->selectRaw('conversation_id, MAX(id) as last_id')
-            ->groupBy('conversation_id');
+            ->selectRaw("{$expr} as canonical_conversation_id, MAX(id) as last_id")
+            ->groupByRaw($expr);
 
         $query = Message::query()
             ->joinSub($latestPerConversation, 'last', function ($join) {
@@ -56,9 +117,9 @@ class MessageController extends Controller
             ->leftJoin('users as sender_u', 'sender_u.id', '=', 'messages.sender_id')
             ->leftJoin('users as recipient_u', 'recipient_u.id', '=', 'messages.recipient_id')
             ->leftJoin('users as owner_u', 'owner_u.id', '=', 'messages.user_id')
-            // deletions for this admin
+            // deletions for this admin (keyed by CANONICAL conversation id)
             ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($actor) {
-                $join->on('mcd.conversation_id', '=', 'messages.conversation_id')
+                $join->on('mcd.conversation_id', '=', 'last.canonical_conversation_id')
                     ->where('mcd.user_id', '=', $actor->id);
             })
             // hide if deleted and the latest message isn't newer than deleted_at
@@ -68,6 +129,7 @@ class MessageController extends Controller
             })
             ->select([
                 'messages.*',
+                'last.canonical_conversation_id as canonical_conversation_id',
 
                 'sender_u.name as sender_user_name',
                 'sender_u.email as sender_user_email',
@@ -100,6 +162,9 @@ class MessageController extends Controller
                   ->orWhere('owner_u.name', 'like', $like)
                   ->orWhere('owner_u.email', 'like', $like);
 
+                // Allow searching by canonical conversation id too
+                $q->orWhere('last.canonical_conversation_id', 'like', $like);
+
                 if (ctype_digit($search)) {
                     $id = (int) $search;
                     $q->orWhere('messages.sender_id', $id)
@@ -112,19 +177,26 @@ class MessageController extends Controller
         $paginator = $query->paginate($perPage);
 
         $conversations = collect($paginator->items())->map(function ($m) {
+            $canonicalId = (string) ($m->canonical_conversation_id ?? $m->conversation_id);
+
             // Prefer actual user.name; fallback to stored sender_name if user missing
             $senderName = $m->sender_user_name ?: ($m->sender_name ?: null);
             $recipientName = $m->recipient_user_name ?: null;
 
+            $senderNormalized = $this->normalizeRole($m->sender);
+            $recipientRoleNormalized = $this->normalizeRole($m->recipient_role);
+
             return [
-                'conversation_id' => $m->conversation_id,
+                'conversation_id' => $canonicalId,
 
                 'last_message' => [
                     'id' => $m->id,
+                    'conversation_id' => $canonicalId,
                     'content' => $m->content,
                     'created_at' => optional($m->created_at)->toISOString(),
 
-                    'sender' => $m->sender,
+                    // normalized role fields (prevents UI-side mismatches)
+                    'sender' => $senderNormalized,
                     'sender_id' => $m->sender_id,
                     'sender_name' => $senderName,
                     'sender_email' => $m->sender_user_email,
@@ -132,7 +204,7 @@ class MessageController extends Controller
                     'sender_avatar_url' => $m->sender_user_avatar,
 
                     'recipient_id' => $m->recipient_id,
-                    'recipient_role' => $m->recipient_role,
+                    'recipient_role' => $recipientRoleNormalized,
                     'recipient_name' => $recipientName,
                     'recipient_email' => $m->recipient_user_email,
                     'recipient_user_role' => $m->recipient_user_role,
@@ -168,6 +240,10 @@ class MessageController extends Controller
     /**
      * GET /admin/messages/conversations/{conversationId}
      * Returns messages in a conversation, respecting per-user deletion timestamp.
+     *
+     * ✅ FIXED:
+     * - Fetches by CANONICAL conversation id (not raw messages.conversation_id) to avoid split threads.
+     * - Normalizes sender/recipient_role in response payload.
      */
     public function showConversation(Request $request, string $conversationId): JsonResponse
     {
@@ -178,6 +254,11 @@ class MessageController extends Controller
             return $this->forbid();
         }
 
+        $conversationId = trim($conversationId);
+        if ($conversationId === '' || strlen($conversationId) > 120) {
+            return response()->json(['message' => 'Invalid conversation id.'], 422);
+        }
+
         $perPageRaw = (int) $request->query('per_page', 50);
         $perPage = $perPageRaw < 1 ? 50 : ($perPageRaw > 200 ? 200 : $perPageRaw);
 
@@ -186,8 +267,10 @@ class MessageController extends Controller
             ->where('conversation_id', $conversationId)
             ->first();
 
+        $expr = $this->canonicalConversationExpr('messages');
+
         $query = Message::query()
-            ->where('conversation_id', $conversationId)
+            ->whereRaw("{$expr} = ?", [$conversationId])
             ->with([
                 'senderUser:id,name,email,role,avatar_url',
                 'recipientUser:id,name,email,role,avatar_url',
@@ -202,16 +285,19 @@ class MessageController extends Controller
 
         $paginator = $query->paginate($perPage);
 
-        $messages = collect($paginator->items())->map(function (Message $m) {
+        $messages = collect($paginator->items())->map(function (Message $m) use ($conversationId) {
             $senderName = $m->senderUser?->name ?: ($m->sender_name ?: null);
+
+            $senderNormalized = $this->normalizeRole($m->sender);
+            $recipientRoleNormalized = $this->normalizeRole($m->recipient_role);
 
             return [
                 'id' => $m->id,
-                'conversation_id' => $m->conversation_id,
+                'conversation_id' => $conversationId,
                 'content' => $m->content,
                 'created_at' => optional($m->created_at)->toISOString(),
 
-                'sender' => $m->sender,
+                'sender' => $senderNormalized,
                 'sender_id' => $m->sender_id,
                 'sender_name' => $senderName,
                 'sender_email' => $m->senderUser?->email,
@@ -219,7 +305,7 @@ class MessageController extends Controller
                 'sender_avatar_url' => $m->senderUser?->avatar_url,
 
                 'recipient_id' => $m->recipient_id,
-                'recipient_role' => $m->recipient_role,
+                'recipient_role' => $recipientRoleNormalized,
                 'recipient_name' => $m->recipientUser?->name,
                 'recipient_email' => $m->recipientUser?->email,
                 'recipient_user_role' => $m->recipientUser?->role,
@@ -257,6 +343,10 @@ class MessageController extends Controller
      * Soft-delete (hide) a conversation for the current admin only.
      *
      * Optional: ?force=1 => hard delete conversation messages for ALL users (admin only).
+     *
+     * ✅ FIXED:
+     * - Hard delete targets ALL messages matching the CANONICAL conversation id,
+     *   even if legacy conversation_id values differ.
      */
     public function destroyConversation(Request $request, string $conversationId): JsonResponse
     {
@@ -267,13 +357,20 @@ class MessageController extends Controller
             return $this->forbid();
         }
 
+        $conversationId = trim($conversationId);
+        if ($conversationId === '' || strlen($conversationId) > 120) {
+            return response()->json(['message' => 'Invalid conversation id.'], 422);
+        }
+
         $force = (string) $request->query('force', '0');
         $forceHardDelete = in_array(strtolower($force), ['1', 'true', 'yes'], true);
+
+        $expr = $this->canonicalConversationExpr('messages');
 
         if ($forceHardDelete) {
             // Hard delete for ALL (dangerous; admin-only)
             Message::query()
-                ->where('conversation_id', $conversationId)
+                ->whereRaw("{$expr} = ?", [$conversationId])
                 ->delete();
 
             MessageConversationDeletion::query()

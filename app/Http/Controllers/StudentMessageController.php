@@ -3,11 +3,12 @@
 namespace App\Http\Controllers;
 
 use App\Models\Message;
-use App\Models\User;
 use App\Models\MessageConversationDeletion;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 
 class StudentMessageController extends Controller
 {
@@ -20,39 +21,80 @@ class StudentMessageController extends Controller
     }
 
     /**
-     * Build the same "conversation id" key the Student UI uses.
-     *
-     * Frontend logic:
-     * - Prefer message.conversation_id if present
-     * - else derive counselor-{id} from sender/recipient
-     * - else counselor-office
+     * Normalize role strings into stable canonical values to avoid mismatches that
+     * create duplicate threads (e.g., "Counsellor", "counselor", "Counselor", etc).
      */
-    private function conversationKey(Message $message): string
+    private function normalizeRole(?string $role): string
     {
-        $raw = $message->conversation_id ?? null;
-        if ($raw !== null && trim((string) $raw) !== '') {
-            return (string) $raw;
+        $r = strtolower(trim((string) $role));
+        $r = str_replace([' ', '-'], ['_', '_'], $r);
+
+        if ($r === '') return '';
+
+        // Common contains-based normalization (covers "guidance_counselor", etc.)
+        if (str_contains($r, 'counselor') || str_contains($r, 'counsellor')) return 'counselor';
+        if (str_contains($r, 'admin')) return 'admin';
+        if (str_contains($r, 'student')) return 'student';
+        if (str_contains($r, 'guest')) return 'guest';
+
+        // Referral user variants
+        if ($r === 'referral_user' || $r === 'referraluser' || $r === 'referral') return 'referral_user';
+
+        // Other known system-ish roles
+        if ($r === 'system') return 'system';
+
+        return $r;
+    }
+
+    /**
+     * Canonical student thread id.
+     *
+     * ✅ This is the single source of truth for the student's conversation_id.
+     * All student messages (incoming/outgoing) are normalized to this value to
+     * prevent duplicate threads when other senders use different ids.
+     */
+    private function canonicalStudentConversationId(User $user): string
+    {
+        return 'student-' . (int) $user->id;
+    }
+
+    /**
+     * Map legacy student UI keys to the canonical student conversation_id.
+     *
+     * Old Student UI logic derived keys like:
+     * - counselor-{id}
+     * - counselor-office
+     *
+     * We treat those as synonyms of the canonical student thread so deletions
+     * remain respected after the change.
+     */
+    private function mapLegacyStudentKeyToCanonical(string $rawKey, string $canonicalStudentKey): string
+    {
+        $k = trim($rawKey);
+        if ($k === '') return '';
+
+        $lk = strtolower($k);
+
+        // Already canonical
+        if ($lk === strtolower($canonicalStudentKey)) {
+            return $canonicalStudentKey;
         }
 
-        $sender = strtolower((string) ($message->sender ?? ''));
-        $senderId = $message->sender_id ?? null;
-
-        $recipientRole = strtolower((string) ($message->recipient_role ?? ''));
-        $recipientId = $message->recipient_id ?? null;
-
-        $counselorId = null;
-
-        if ($sender === 'counselor' && $senderId !== null && trim((string) $senderId) !== '') {
-            $counselorId = $senderId;
-        } elseif ($recipientRole === 'counselor' && $recipientId !== null && trim((string) $recipientId) !== '') {
-            $counselorId = $recipientId;
+        // Legacy keys produced by Student UI
+        if ($lk === 'counselor-office') {
+            return $canonicalStudentKey;
+        }
+        if (str_starts_with($lk, 'counselor-')) {
+            return $canonicalStudentKey;
         }
 
-        if ($counselorId !== null && trim((string) $counselorId) !== '') {
-            return 'counselor-' . (string) $counselorId;
+        // If older variants existed (e.g., "student_{id}" or "student {id}")
+        $lk2 = str_replace([' ', '_'], ['-', '-'], $lk);
+        if (str_starts_with($lk2, 'student-')) {
+            return $lk2;
         }
 
-        return 'counselor-office';
+        return $k;
     }
 
     /**
@@ -61,61 +103,79 @@ class StudentMessageController extends Controller
      * Fetch all messages for the authenticated student/guest.
      *
      * ✅ FIXED:
-     * Respect "conversation deletions" so deleted threads stay hidden after refresh.
-     * If a conversation was deleted at time T, only show messages created AFTER T.
+     * - Enforce canonical conversation_id ("student-{id}") for ALL returned rows
+     *   to prevent duplicate threads on the frontend.
+     * - Normalize sender/recipient_role values to stable canonical roles.
+     * - Respect conversation deletions: if deleted at time T, only show messages created AFTER T.
+     *   (Also respects legacy deletion keys like "counselor-office", "counselor-{id}".)
      */
     public function index(Request $request): JsonResponse
     {
+        /** @var User|null $user */
         $user = $request->user();
 
         if (! $user) {
-            return response()->json([
-                'message' => 'Unauthenticated.',
-            ], 401);
+            return response()->json(['message' => 'Unauthenticated.'], 401);
         }
 
-        // Load deletion cutoffs for this user (conversation_id => deleted_at)
+        $canonicalConversationId = $this->canonicalStudentConversationId($user);
+
+        // Load deletion cutoffs for this user and reduce into a single cutoff for the canonical student thread.
         $deletions = MessageConversationDeletion::query()
             ->where('user_id', (int) $user->id)
             ->whereNotNull('deleted_at')
             ->get(['conversation_id', 'deleted_at']);
 
-        $deletedAtByConversation = [];
+        $cutoff = null; /** @var Carbon|null $cutoff */
         foreach ($deletions as $d) {
-            $key = trim((string) ($d->conversation_id ?? ''));
-            if ($key === '') continue;
-            $deletedAtByConversation[$key] = $d->deleted_at; // Carbon (cast)
-        }
+            $rawKey = trim((string) ($d->conversation_id ?? ''));
+            if ($rawKey === '') continue;
 
-        // Fetch all messages for this user
-        $messages = Message::query()
-            ->where('user_id', $user->id)
-            ->orderBy('created_at', 'asc')
-            ->orderBy('id', 'asc')
-            ->get();
+            $mappedKey = $this->mapLegacyStudentKeyToCanonical($rawKey, $canonicalConversationId);
 
-        // Filter out messages that are "before or at" the delete cutoff for that conversation
-        $visibleMessages = $messages->filter(function (Message $m) use ($deletedAtByConversation) {
-            $key = $this->conversationKey($m);
-
-            if (! array_key_exists($key, $deletedAtByConversation)) {
-                return true;
+            // Only apply deletions that resolve to the canonical student thread
+            if (strtolower($mappedKey) !== strtolower($canonicalConversationId)) {
+                continue;
             }
 
-            $cutoff = $deletedAtByConversation[$key] ?? null;
-            if (! $cutoff) return true;
+            if (! $d->deleted_at) continue;
 
-            $createdAt = $m->created_at instanceof Carbon
-                ? $m->created_at
-                : Carbon::parse((string) $m->created_at);
+            if (! $cutoff) {
+                $cutoff = $d->deleted_at;
+            } else {
+                if ($d->deleted_at->gt($cutoff)) {
+                    $cutoff = $d->deleted_at;
+                }
+            }
+        }
 
-            // Only show messages strictly after the deletion moment
-            return $createdAt->gt($cutoff);
-        })->values();
+        // Fetch messages owned by this student.
+        $query = Message::query()
+            ->where('user_id', $user->id)
+            ->orderBy('created_at', 'asc')
+            ->orderBy('id', 'asc');
+
+        if ($cutoff) {
+            $query->where('created_at', '>', $cutoff);
+        }
+
+        $messages = $query->get();
+
+        // Enforce canonical conversation_id + normalize roles in the payload
+        $messages->transform(function (Message $m) use ($canonicalConversationId) {
+            $m->conversation_id = $canonicalConversationId;
+
+            $m->sender = $this->normalizeRole($m->sender);
+            $m->recipient_role = $this->normalizeRole($m->recipient_role);
+
+            return $m;
+        });
 
         return response()->json([
             'message'  => 'Fetched your messages.',
-            'messages' => $visibleMessages,
+            'messages' => $messages->values(),
+            'canonical_conversation_id' => $canonicalConversationId,
+            'deleted_cutoff' => $cutoff ? $cutoff->toISOString() : null,
         ]);
     }
 
@@ -124,29 +184,27 @@ class StudentMessageController extends Controller
      *
      * Create a new message authored by the current student OR guest.
      *
-     * Supports optional UI fields:
-     *   - recipient_role (must be counselor if provided)
-     *   - recipient_id (optional; if provided must be a counselor user)
-     *   - conversation_id (hint; will be normalized to the canonical student thread)
+     * ✅ FIXED:
+     * - Enforce canonical conversation_id ("student-{id}") ALWAYS.
+     * - Normalize/validate recipient_role variations; students can only message counselors here.
      */
     public function store(Request $request): JsonResponse
     {
+        /** @var User|null $user */
         $user = $request->user();
 
         if (! $user) {
-            return response()->json([
-                'message' => 'Unauthenticated.',
-            ], 401);
+            return response()->json(['message' => 'Unauthenticated.'], 401);
         }
 
         $data = $request->validate([
             'content' => ['required', 'string'],
 
-            // UI may send these; we keep them optional but safe.
-            'recipient_role' => ['nullable', 'in:counselor'],
+            // UI may send these; keep optional but normalize safely.
+            'recipient_role' => ['nullable', 'string', 'max:50'],
             'recipient_id'   => ['nullable', 'integer', 'exists:users,id'],
 
-            // Accept string OR integer conversation ids from the frontend
+            // Accept string OR integer conversation ids from the frontend (ignored; we enforce canonical).
             'conversation_id' => [
                 'nullable',
                 function ($attribute, $value, $fail) {
@@ -162,8 +220,15 @@ class StudentMessageController extends Controller
             ],
         ]);
 
-        $role = strtolower((string) ($user->role ?? 'student'));
-        $senderRole = str_contains($role, 'guest') ? 'guest' : 'student';
+        $userRole = $this->normalizeRole((string) ($user->role ?? 'student'));
+        $senderRole = ($userRole === 'guest') ? 'guest' : 'student';
+
+        $recipientRoleInput = $this->normalizeRole($data['recipient_role'] ?? 'counselor');
+        if ($recipientRoleInput !== '' && $recipientRoleInput !== 'counselor') {
+            return response()->json([
+                'message' => 'Invalid recipient_role. Students can only message counselors.',
+            ], 422);
+        }
 
         $recipientId = isset($data['recipient_id']) ? (int) $data['recipient_id'] : null;
 
@@ -171,31 +236,22 @@ class StudentMessageController extends Controller
         if ($recipientId) {
             $recipientUser = User::find($recipientId);
             if (! $recipientUser || ! $this->isCounselor($recipientUser)) {
-                return response()->json([
-                    'message' => 'Recipient is not a counselor.',
-                ], 422);
+                return response()->json(['message' => 'Recipient is not a counselor.'], 422);
             }
         }
 
-        // Canonical conversation id for the student/guest thread
-        $canonicalConversationId = "student-{$user->id}";
-
-        // Accept the provided conversation_id only if it matches the canonical thread id.
-        // (Prevents clients from spoofing/mixing threads.)
-        $conversationHint = $data['conversation_id'] ?? null;
-        $conversationId = ((string) $conversationHint === $canonicalConversationId)
-            ? $canonicalConversationId
-            : $canonicalConversationId;
+        // ✅ Enforce canonical conversation id for student thread
+        $conversationId = $this->canonicalStudentConversationId($user);
 
         $message = new Message();
-        $message->user_id     = $user->id;
+        $message->user_id = (int) $user->id;
 
-        $message->sender      = $senderRole;
-        $message->sender_id   = (int) $user->id;
+        $message->sender = $senderRole;
+        $message->sender_id = (int) $user->id;
         $message->sender_name = $user->name ?? null;
 
         $message->recipient_role = 'counselor';
-        $message->recipient_id   = $recipientId; // null = office inbox; int = direct counselor
+        $message->recipient_id = $recipientId; // null = office inbox; int = direct counselor
 
         $message->conversation_id = $conversationId;
 
@@ -211,9 +267,15 @@ class StudentMessageController extends Controller
 
         $message->save();
 
+        // Normalize payload roles (defensive)
+        $message->sender = $this->normalizeRole($message->sender);
+        $message->recipient_role = $this->normalizeRole($message->recipient_role);
+        $message->conversation_id = $conversationId;
+
         return response()->json([
-            'message'       => 'Your message has been sent.',
+            'message' => 'Your message has been sent.',
             'messageRecord' => $message,
+            'canonical_conversation_id' => $conversationId,
         ], 201);
     }
 
@@ -224,19 +286,21 @@ class StudentMessageController extends Controller
      * Only affects messages belonging to current user.
      *
      * - If message_ids omitted/empty => mark all as read.
+     *
+     * ✅ FIXED:
+     * - Use case-insensitive sender matching so "Counselor" vs "counselor" doesn't break read status updates.
      */
     public function markAsRead(Request $request): JsonResponse
     {
+        /** @var User|null $user */
         $user = $request->user();
 
         if (! $user) {
-            return response()->json([
-                'message' => 'Unauthenticated.',
-            ], 401);
+            return response()->json(['message' => 'Unauthenticated.'], 401);
         }
 
         $data = $request->validate([
-            'message_ids'   => ['nullable', 'array'],
+            'message_ids' => ['nullable', 'array'],
             'message_ids.*' => ['integer'],
         ]);
 
@@ -246,7 +310,7 @@ class StudentMessageController extends Controller
 
         // Typically only counselor/system messages are unread for student
         // (Student outgoing messages are stored as is_read=true.)
-        $query->whereIn('sender', ['counselor', 'system']);
+        $query->whereIn(DB::raw('LOWER(sender)'), ['counselor', 'system']);
 
         $messageIds = $data['message_ids'] ?? null;
 
@@ -260,7 +324,7 @@ class StudentMessageController extends Controller
         ]);
 
         return response()->json([
-            'message'       => 'Messages marked as read.',
+            'message' => 'Messages marked as read.',
             'updated_count' => $updatedCount,
         ]);
     }
