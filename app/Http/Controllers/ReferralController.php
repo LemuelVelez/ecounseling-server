@@ -46,6 +46,16 @@ class ReferralController extends Controller
     }
 
     /**
+     * ✅ Appointment columns may or may not exist depending on migrations.
+     * We guard updates to avoid silent "not saved" behavior or SQL errors.
+     */
+    private function referralHasScheduleColumns(): bool
+    {
+        return Schema::hasColumn('referrals', 'scheduled_date')
+            && Schema::hasColumn('referrals', 'scheduled_time');
+    }
+
+    /**
      * Only select columns that actually exist in the users table to avoid SQL errors (500).
      */
     private function userSelectColumns(array $extras = []): array
@@ -158,6 +168,12 @@ class ReferralController extends Controller
         $ref->status = 'pending';
         $ref->handled_at = null;
         $ref->closed_at = null;
+
+        // ✅ Appointment fields (if columns exist, ensure null defaults)
+        if ($this->referralHasScheduleColumns()) {
+            $ref->scheduled_date = null;
+            $ref->scheduled_time = null;
+        }
 
         $ref->save();
 
@@ -299,6 +315,9 @@ class ReferralController extends Controller
 
     /**
      * PATCH /counselor/referrals/{id}
+     *
+     * ✅ FIX: allow counselor to save scheduled_date + scheduled_time (appointment)
+     * so the frontend "Set Appointment" is persisted.
      */
     public function update(Request $request, int $id): JsonResponse
     {
@@ -318,8 +337,23 @@ class ReferralController extends Controller
                 'status'       => ['nullable', 'in:pending,handled,closed'],
                 'remarks'      => ['nullable', 'string'],
                 'counselor_id' => ['nullable', 'integer', 'exists:users,id'],
+
+                // ✅ Appointment fields (primary names used by the frontend)
+                'scheduled_date' => ['nullable', 'date'],
+                'scheduled_time' => ['nullable', 'string', 'max:50'],
+
+                // ✅ Back-compat aliases (in case other clients send different keys)
+                'appointment_date' => ['nullable', 'date'],
+                'appointment_time' => ['nullable', 'string', 'max:50'],
+                'schedule_date'    => ['nullable', 'date'],
+                'schedule_time'    => ['nullable', 'string', 'max:50'],
+                'counseling_date'  => ['nullable', 'date'],
+                'counseling_time'  => ['nullable', 'string', 'max:50'],
             ]);
 
+            /**
+             * ✅ Handle counselor assignment
+             */
             if (array_key_exists('counselor_id', $data)) {
                 $counselorId = $data['counselor_id'];
 
@@ -344,10 +378,87 @@ class ReferralController extends Controller
                 }
             }
 
+            /**
+             * ✅ Handle remarks (allow clearing to null)
+             */
             if (array_key_exists('remarks', $data)) {
                 $ref->remarks = $data['remarks'];
             }
 
+            /**
+             * ✅ Handle appointment (scheduled_date + scheduled_time)
+             * - supports aliases
+             * - enforces "both or none"
+             * - guards for missing DB columns (prevents silent failure)
+             */
+            $scheduleKeys = [
+                'scheduled_date',
+                'scheduled_time',
+                'appointment_date',
+                'appointment_time',
+                'schedule_date',
+                'schedule_time',
+                'counseling_date',
+                'counseling_time',
+            ];
+
+            $hasAnyScheduleInput = false;
+            foreach ($scheduleKeys as $k) {
+                if (array_key_exists($k, $data)) {
+                    $hasAnyScheduleInput = true;
+                    break;
+                }
+            }
+
+            if ($hasAnyScheduleInput) {
+                if (! $this->referralHasScheduleColumns()) {
+                    return response()->json([
+                        'message' =>
+                            'Referral appointment columns are missing. Please run the migration to add referrals.scheduled_date and referrals.scheduled_time.',
+                    ], 422);
+                }
+
+                $incomingDate =
+                    $data['scheduled_date']
+                    ?? $data['appointment_date']
+                    ?? $data['schedule_date']
+                    ?? $data['counseling_date']
+                    ?? null;
+
+                $incomingTime =
+                    $data['scheduled_time']
+                    ?? $data['appointment_time']
+                    ?? $data['schedule_time']
+                    ?? $data['counseling_time']
+                    ?? null;
+
+                // enforce "both or none"
+                if (($incomingDate && ! $incomingTime) || (! $incomingDate && $incomingTime)) {
+                    return response()->json([
+                        'message' => 'Please provide BOTH scheduled date and scheduled time.',
+                    ], 422);
+                }
+
+                // set or clear
+                $ref->scheduled_date = $incomingDate ?: null;
+                $ref->scheduled_time = $incomingTime ?: null;
+
+                // If appointment is set and status NOT explicitly provided, auto-mark handled.
+                if ($incomingDate && $incomingTime && empty($data['status'])) {
+                    $ref->status = 'handled';
+                    $ref->handled_at = $ref->handled_at ?? now();
+                }
+
+                // If appointment is set and counselor_id NOT explicitly provided,
+                // and there is currently no assigned counselor, assign the actor by default.
+                if ($incomingDate && $incomingTime && ! array_key_exists('counselor_id', $data) && empty($ref->counselor_id)) {
+                    $ref->counselor_id = (int) $actor->id;
+                }
+            }
+
+            /**
+             * ✅ Handle status change (kept counselor-only)
+             */
             if (! empty($data['status'])) {
                 $status = strtolower((string) $data['status']);
                 $ref->status = $status;
@@ -362,7 +473,6 @@ class ReferralController extends Controller
             }
 
             $ref->save();
-
             $ref->load($this->referralWith());
 
             return response()->json([
