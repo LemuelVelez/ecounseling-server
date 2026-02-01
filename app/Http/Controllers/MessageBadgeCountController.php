@@ -20,13 +20,26 @@ class MessageBadgeCountController extends Controller
             || str_contains($role, 'guidance');
     }
 
+    private static function isAdmin(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+
+        return str_contains($role, 'admin');
+    }
+
     private static function isReferralUser(?User $user): bool
     {
         if (! $user) return false;
 
         $role = strtolower((string) ($user->role ?? ''));
 
-        return str_contains($role, 'dean')
+        // ✅ IMPORTANT: include literal referral_user and common office roles
+        return str_contains($role, 'referral_user')
+            || str_contains($role, 'referral user')
+            || str_contains($role, 'referral-user')
+            || str_contains($role, 'dean')
             || str_contains($role, 'registrar')
             || str_contains($role, 'program chair')
             || str_contains($role, 'program_chair')
@@ -37,13 +50,11 @@ class MessageBadgeCountController extends Controller
     /**
      * ✅ Public helper used by NotificationController
      *
-     * IMPORTANT:
-     * We count "unread conversations" by looking at the LATEST message per conversation:
-     * - Counselor: latest message is addressed to counselor AND counselor_is_read=false
+     * Counts "unread conversations" by looking at the LATEST message per conversation:
+     * - Counselor: latest message is addressed to counselor AND (counselor_is_read=false OR is_read=false)
+     * - Admin: latest message is addressed to admin AND is_read=false
+     * - Referral user: latest message is addressed to referral user AND is_read=false
      * - Student/Guest: latest message is from counselor/system AND is_read=false
-     *
-     * This prevents the badge from staying nonzero because of older unread messages
-     * that are already "handled" (e.g., you already replied, so latest message is yours).
      */
     public static function unreadConversationCountFor(User $user): int
     {
@@ -51,20 +62,17 @@ class MessageBadgeCountController extends Controller
             return self::unreadConversationCountForCounselor($user);
         }
 
-        if (self::isReferralUser($user)) {
-            // Your current system doesn't implement referral-user message read flags.
-            // Keep at 0 unless you add referral-user messaging read tracking.
-            return 0;
+        if (self::isAdmin($user)) {
+            return self::unreadConversationCountForAdmin($user);
         }
 
-        // Student / Guest
+        if (self::isReferralUser($user)) {
+            return self::unreadConversationCountForReferralUser($user);
+        }
+
         return self::unreadConversationCountForStudentOrGuest($user);
     }
 
-    /**
-     * Optional endpoint if you want to use it directly later:
-     * GET /messages/unread-conversations-count
-     */
     public function unreadConversationsCount(Request $request): JsonResponse
     {
         $user = $request->user();
@@ -88,8 +96,7 @@ class MessageBadgeCountController extends Controller
     {
         $userId = (int) $user->id;
 
-        // Same effective conversation key you used in CounselorMessageController@index
-        $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
+        $effectiveConversationIdSql = "COALESCE(NULLIF(messages.conversation_id,''), CONCAT('student-', messages.user_id))";
 
         $base = DB::table('messages')
             ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($userId, $effectiveConversationIdSql) {
@@ -97,7 +104,6 @@ class MessageBadgeCountController extends Controller
                     ->where('mcd.user_id', '=', $userId);
             })
             ->where(function ($q) use ($userId) {
-                // 1) Incoming to counselor (direct or office)
                 $q->where(function ($q2) use ($userId) {
                     $q2->where('messages.recipient_role', 'counselor')
                         ->where(function ($q3) use ($userId) {
@@ -105,32 +111,27 @@ class MessageBadgeCountController extends Controller
                                 ->orWhere('messages.recipient_id', '=', $userId);
                         });
                 })
-
-                // 2) Student threads (conversation_id like student-%)
                 ->orWhere(function ($q2) {
                     $q2->whereNotNull('messages.conversation_id')
                         ->where('messages.conversation_id', 'like', 'student-%');
                 })
-
-                // 3) Anything the current counselor sent (so latest message can be your reply)
                 ->orWhere(function ($q2) use ($userId) {
                     $q2->where('messages.sender', 'counselor')
                         ->where('messages.sender_id', '=', $userId);
                 });
             })
-            // Respect conversation deletions (hide messages before deleted_at for that user)
             ->where(function ($q) {
                 $q->whereNull('mcd.deleted_at')
                     ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
             });
 
-        // Rank messages per conversation (latest = rn=1)
         $ranked = $base->select([
             'messages.id',
             DB::raw($effectiveConversationIdSql . ' as conversation_id'),
             'messages.sender',
             'messages.recipient_role',
             'messages.recipient_id',
+            'messages.is_read',
             'messages.counselor_is_read',
             'messages.created_at',
             DB::raw("ROW_NUMBER() OVER (PARTITION BY {$effectiveConversationIdSql} ORDER BY messages.created_at DESC, messages.id DESC) as rn"),
@@ -140,14 +141,121 @@ class MessageBadgeCountController extends Controller
             ->fromSub($ranked, 't')
             ->where('t.rn', '=', 1);
 
-        // Count conversations where the LATEST message is an unread incoming message to counselor
+        // ✅ IMPORTANT: support both schemas:
+        // - counselor_is_read column
+        // - OR is_read column (older implementations)
         $count = $latestPerConversation
             ->where('t.recipient_role', '=', 'counselor')
             ->where(function ($q) use ($userId) {
                 $q->whereNull('t.recipient_id')
                     ->orWhere('t.recipient_id', '=', $userId);
             })
-            ->where('t.counselor_is_read', '=', false)
+            ->where(function ($q) {
+                $q->where('t.counselor_is_read', '=', false)
+                  ->orWhereNull('t.counselor_is_read')
+                  ->where(function ($q2) {
+                      $q2->where('t.is_read', '=', false)
+                         ->orWhereNull('t.is_read')
+                         ->orWhere('t.is_read', '=', 0);
+                  });
+            })
+            ->count();
+
+        return (int) $count;
+    }
+
+    private static function unreadConversationCountForAdmin(User $user): int
+    {
+        $userId = (string) $user->id;
+
+        // Group by conversation_id when present (admin controller uses canonical ids there)
+        $effectiveConversationIdSql = "COALESCE(NULLIF(messages.conversation_id,''), CONCAT('msg-', messages.id))";
+
+        $base = DB::table('messages')
+            ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($userId, $effectiveConversationIdSql) {
+                $join->on(DB::raw($effectiveConversationIdSql), '=', 'mcd.conversation_id')
+                    ->where('mcd.user_id', '=', $userId);
+            })
+            ->where(function ($q) use ($userId) {
+                // messages involving this admin (so latest message can be admin reply)
+                $q->whereRaw('CAST(messages.recipient_id AS CHAR) = ?', [$userId])
+                  ->orWhere(function ($q2) use ($userId) {
+                      $q2->where('messages.sender', '=', 'admin')
+                         ->whereRaw('CAST(messages.sender_id AS CHAR) = ?', [$userId]);
+                  });
+            })
+            ->where(function ($q) {
+                $q->whereNull('mcd.deleted_at')
+                    ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
+            });
+
+        $ranked = $base->select([
+            'messages.id',
+            DB::raw($effectiveConversationIdSql . ' as conversation_id'),
+            'messages.sender',
+            'messages.recipient_id',
+            'messages.recipient_role',
+            'messages.is_read',
+            'messages.created_at',
+            DB::raw("ROW_NUMBER() OVER (PARTITION BY {$effectiveConversationIdSql} ORDER BY messages.created_at DESC, messages.id DESC) as rn"),
+        ]);
+
+        $latest = DB::query()->fromSub($ranked, 't')->where('t.rn', '=', 1);
+
+        // Latest must be incoming to this admin AND unread
+        $count = $latest
+            ->whereRaw('CAST(t.recipient_id AS CHAR) = ?', [$userId])
+            ->where(function ($q) {
+                $q->where('t.is_read', '=', false)
+                  ->orWhereNull('t.is_read')
+                  ->orWhere('t.is_read', '=', 0);
+            })
+            ->count();
+
+        return (int) $count;
+    }
+
+    private static function unreadConversationCountForReferralUser(User $user): int
+    {
+        $userId = (string) $user->id;
+
+        $effectiveConversationIdSql = "COALESCE(NULLIF(messages.conversation_id,''), CONCAT('msg-', messages.id))";
+
+        $base = DB::table('messages')
+            ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($userId, $effectiveConversationIdSql) {
+                $join->on(DB::raw($effectiveConversationIdSql), '=', 'mcd.conversation_id')
+                    ->where('mcd.user_id', '=', $userId);
+            })
+            ->where(function ($q) use ($userId) {
+                $q->whereRaw('CAST(messages.recipient_id AS CHAR) = ?', [$userId])
+                  ->orWhere(function ($q2) use ($userId) {
+                      $q2->whereRaw('CAST(messages.sender_id AS CHAR) = ?', [$userId]);
+                  });
+            })
+            ->where(function ($q) {
+                $q->whereNull('mcd.deleted_at')
+                    ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
+            });
+
+        $ranked = $base->select([
+            'messages.id',
+            DB::raw($effectiveConversationIdSql . ' as conversation_id'),
+            'messages.sender',
+            'messages.recipient_id',
+            'messages.is_read',
+            'messages.created_at',
+            DB::raw("ROW_NUMBER() OVER (PARTITION BY {$effectiveConversationIdSql} ORDER BY messages.created_at DESC, messages.id DESC) as rn"),
+        ]);
+
+        $latest = DB::query()->fromSub($ranked, 't')->where('t.rn', '=', 1);
+
+        $count = $latest
+            ->whereRaw('CAST(t.recipient_id AS CHAR) = ?', [$userId])
+            ->where(function ($q) {
+                $q->where('t.is_read', '=', false)
+                  ->orWhereNull('t.is_read')
+                  ->orWhere('t.is_read', '=', 0);
+            })
             ->count();
 
         return (int) $count;
@@ -157,8 +265,7 @@ class MessageBadgeCountController extends Controller
     {
         $userId = (int) $user->id;
 
-        // Student/guest thread key fallback
-        $effectiveConversationIdSql = "COALESCE(messages.conversation_id, CONCAT('student-', messages.user_id))";
+        $effectiveConversationIdSql = "COALESCE(NULLIF(messages.conversation_id,''), CONCAT('student-', messages.user_id))";
 
         $base = DB::table('messages')
             ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($userId, $effectiveConversationIdSql) {
@@ -184,10 +291,13 @@ class MessageBadgeCountController extends Controller
             ->fromSub($ranked, 't')
             ->where('t.rn', '=', 1);
 
-        // Student/Guest unread: latest message is from counselor/system AND student read flag is false
         $count = $latestPerConversation
             ->whereIn('t.sender', ['counselor', 'system'])
-            ->where('t.is_read', '=', false)
+            ->where(function ($q) {
+                $q->where('t.is_read', '=', false)
+                  ->orWhereNull('t.is_read')
+                  ->orWhere('t.is_read', '=', 0);
+            })
             ->count();
 
         return (int) $count;

@@ -499,6 +499,52 @@ class MessageController extends Controller
     }
 
     /**
+     * ✅ NEW: POST /admin/messages/mark-as-read
+     * Mark specific message ids as read for the CURRENT admin (recipient).
+     *
+     * This is what makes "open thread" / "reply" persistently clear unread status.
+     */
+    public function markAsRead(Request $request): JsonResponse
+    {
+        /** @var User|null $actor */
+        $actor = $request->user();
+
+        if (! $this->isAdmin($actor)) {
+            return $this->forbid();
+        }
+
+        $validated = $request->validate([
+            'message_ids' => ['required', 'array', 'min:1'],
+            'message_ids.*' => ['integer'],
+        ]);
+
+        $ids = array_values(array_unique(array_map('intval', (array) ($validated['message_ids'] ?? []))));
+        $ids = array_values(array_filter($ids, fn ($v) => is_int($v) && $v > 0));
+
+        if (count($ids) === 0) {
+            return response()->json([
+                'message' => 'No message ids provided.',
+                'updated_count' => 0,
+            ], 200);
+        }
+
+        // Only mark messages where THIS admin is the recipient.
+        // We use recipient_id to be resilient even if recipient_role is missing/legacy.
+        $updated = Message::query()
+            ->whereIn('id', $ids)
+            ->whereNotNull('recipient_id')
+            ->whereRaw('CAST(recipient_id AS CHAR) = ?', [(string) $actor->id])
+            ->update([
+                'is_read' => true,
+            ]);
+
+        return response()->json([
+            'message' => 'Marked messages as read.',
+            'updated_count' => (int) $updated,
+        ], 200);
+    }
+
+    /**
      * DELETE /admin/messages/conversations/{conversationId}
      * Soft-delete (hide) a conversation for the current admin only.
      *

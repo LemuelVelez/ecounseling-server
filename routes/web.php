@@ -770,7 +770,10 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
     Route::get('messages', [AdminMessageController::class, 'index'])
         ->name('admin.messages.index');
 
-    // ✅ FIX (405): enable POST /admin/messages
+    // ✅ FIX: correct path (WAS accidentally /admin/admin/messages/mark-as-read)
+    Route::post('messages/mark-as-read', [AdminMessageController::class, 'markAsRead'])
+        ->name('admin.messages.markAsRead');
+
     Route::post('messages', [AdminMessageController::class, 'store'])
         ->name('admin.messages.store');
 
@@ -789,6 +792,7 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
     Route::delete('messages/{id}', [AdminMessageController::class, 'destroy'])
         ->whereNumber('id')
         ->name('admin.messages.destroy');
+
 });
 
 /*
