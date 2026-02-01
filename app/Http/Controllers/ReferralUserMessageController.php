@@ -39,6 +39,15 @@ class ReferralUserMessageController extends Controller
             || str_contains($role, 'guidance');
     }
 
+    private function isAdmin(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+
+        return str_contains($role, 'admin');
+    }
+
     private function isCounselorSenderValue(?string $sender): bool
     {
         $s = strtolower(trim((string) $sender));
@@ -46,6 +55,12 @@ class ReferralUserMessageController extends Controller
             || str_contains($s, 'counselor')
             || str_contains($s, 'counsellor')
             || str_contains($s, 'guidance');
+    }
+
+    private function isAdminSenderValue(?string $sender): bool
+    {
+        $s = strtolower(trim((string) $sender));
+        return $s === 'admin' || str_contains($s, 'admin');
     }
 
     /**
@@ -73,26 +88,29 @@ class ReferralUserMessageController extends Controller
     }
 
     /**
-     * ✅ Canonical conversation id for referral_user <-> counselor
+     * ✅ Canonical conversation id for referral_user <-> {counselor|admin}
      * This MUST be stable so replies never create a "new thread".
      */
-    private function conversationIdFor(int $referralUserId, int $counselorId): string
+    private function conversationIdFor(int $referralUserId, string $peerRole, int $peerId): string
     {
-        return "referral_user-{$referralUserId}-counselor-{$counselorId}";
+        $peerRole = strtolower(trim($peerRole));
+        if (! in_array($peerRole, ['counselor', 'admin'], true)) {
+            $peerRole = 'counselor';
+        }
+
+        return "referral_user-{$referralUserId}-{$peerRole}-{$peerId}";
     }
 
     /**
      * ✅ Only treat a stored conversation_id as canonical if it matches:
-     *    referral_user-{refId}-counselor-{counselorId}
-     *
-     * This prevents legacy values like "referral_user-5" from splitting threads.
+     *    referral_user-{refId}-(counselor|admin)-{peerId}
      */
     private function isCanonicalConversationId(?string $conversationId): bool
     {
         $s = trim((string) $conversationId);
         if ($s === '') return false;
 
-        return (bool) preg_match('/^referral_user-\d+-counselor-\d+$/', $s);
+        return (bool) preg_match('/^referral_user-\d+-(counselor|admin)-\d+$/', $s);
     }
 
     /**
@@ -116,17 +134,19 @@ class ReferralUserMessageController extends Controller
         $senderId = (int) ($m->sender_id ?? 0);
         $recipientId = (int) ($m->recipient_id ?? 0);
 
-        $recipientRole = $this->normalizeRecipientRole($m->recipient_role ?? '');
+        $recipientRole = strtolower(trim((string) ($m->recipient_role ?? '')));
+        $recipientRoleNorm = $this->normalizeRecipientRole($m->recipient_role ?? '');
 
-        // referral_user -> counselor
-        if ($sender === 'referral_user' && $recipientRole === 'counselor' && $senderId > 0 && $recipientId > 0) {
-            return $this->conversationIdFor($senderId, $recipientId);
+        // referral_user -> counselor/admin
+        if ($sender === 'referral_user' && in_array($recipientRole, ['counselor', 'admin'], true) && $senderId > 0 && $recipientId > 0) {
+            return $this->conversationIdFor($senderId, $recipientRole, $recipientId);
         }
 
-        // counselor -> referral_user (and legacy counselor sender variants)
-        if ($this->isCounselorSenderValue($sender) && $recipientRole === 'referral_user' && $senderId > 0 && $recipientId > 0) {
-            // NOTE: recipient_id is referral user, sender_id is counselor
-            return $this->conversationIdFor($recipientId, $senderId);
+        // counselor/admin -> referral_user (and legacy counselor sender variants)
+        if (($this->isCounselorSenderValue($sender) || $this->isAdminSenderValue($sender)) && $recipientRoleNorm === 'referral_user' && $senderId > 0 && $recipientId > 0) {
+            // recipient_id is referral user, sender_id is peer
+            $peerRole = $this->isAdminSenderValue($sender) ? 'admin' : 'counselor';
+            return $this->conversationIdFor($recipientId, $peerRole, $senderId);
         }
 
         // legacy-safe fallback (keeps it unique to this referral user)
@@ -162,7 +182,6 @@ class ReferralUserMessageController extends Controller
         /**
          * ✅ CRITICAL FIX:
          * Always return a stable, canonical conversation_id so the frontend never splits threads.
-         * This also "repairs" legacy rows that stored "referral_user-{id}".
          */
         $dto['conversation_id'] = $this->conversationKey($m);
 
@@ -189,8 +208,8 @@ class ReferralUserMessageController extends Controller
      *
      * Privacy enforcement:
      * - Referral user sees only:
-     *   (A) Messages they sent to counselors
-     *   (B) Messages counselors sent to them
+     *   (A) Messages they sent to counselors/admins
+     *   (B) Messages counselors/admins sent to them
      */
     public function index(Request $request): JsonResponse
     {
@@ -214,8 +233,8 @@ class ReferralUserMessageController extends Controller
             $deletedAtByConversation[$key] = $d->deleted_at;
 
             // ✅ Backward compatibility:
-            // If a deletion was stored as "referral_user-{id}", treat it as a prefix for:
-            // "referral_user-{id}-counselor-{counselorId}"
+            // If a deletion was stored as "referral_user-{id}", treat it as a prefix for canonical:
+            // "referral_user-{id}-{peerRole}-{peerId}"
             if (preg_match('/^referral_user-\d+$/', $key)) {
                 $legacyPrefixes[$key] = $d->deleted_at;
             }
@@ -227,13 +246,13 @@ class ReferralUserMessageController extends Controller
                 'recipientUser:id,name,avatar_url',
             ])
             ->where(function ($q) use ($user) {
-                // (A) Sent by this referral user -> counselor only
+                // (A) Sent by this referral user -> counselor/admin only
                 $q->where(function ($q2) use ($user) {
                     $q2->where('sender', 'referral_user')
                         ->where('sender_id', (int) $user->id)
-                        ->where('recipient_role', 'counselor');
+                        ->whereIn('recipient_role', ['counselor', 'admin']);
                 })
-                // (B) Sent by counselor -> this referral user only
+                // (B) Sent by counselor/admin -> this referral user only
                 ->orWhere(function ($q2) use ($user) {
                     // be robust to older recipient_role variants
                     $q2->where(function ($rr) {
@@ -248,10 +267,13 @@ class ReferralUserMessageController extends Controller
                     })
                     ->where('recipient_id', (int) $user->id)
                     ->where(function ($q3) {
+                        // counselor OR admin senders (and legacy variants)
                         $q3->where('sender', 'counselor')
+                           ->orWhere('sender', 'admin')
                            ->orWhereRaw('LOWER(sender) LIKE ?', ['%counselor%'])
                            ->orWhereRaw('LOWER(sender) LIKE ?', ['%counsellor%'])
-                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%']);
+                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%'])
+                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%admin%']);
                     });
                 });
             })
@@ -292,7 +314,7 @@ class ReferralUserMessageController extends Controller
 
     /**
      * POST /referral-user/messages
-     * Referral user can message a specific counselor (direct only).
+     * Referral user can message a specific counselor OR admin (direct only).
      */
     public function store(Request $request): JsonResponse
     {
@@ -305,23 +327,29 @@ class ReferralUserMessageController extends Controller
             'content' => ['required', 'string', 'max:5000'],
             'recipient_id' => ['required', 'integer', 'exists:users,id'],
 
-            /**
-             * ✅ IMPORTANT FIX:
-             * We allow the client to send conversation_id, but we DO NOT reject it anymore.
-             * Older UIs may send legacy ids (e.g., "referral_user-{id}") which caused 422.
-             * The server always computes and stores the canonical id anyway.
-             */
+            // optional; server will compute canonical regardless
+            'recipient_role' => ['nullable', 'string', 'max:50'],
             'conversation_id' => ['nullable', 'string', 'max:255'],
         ]);
 
-        $counselorId = (int) $data['recipient_id'];
+        $peerId = (int) $data['recipient_id'];
+        $peer = User::find($peerId);
 
-        $counselor = User::find($counselorId);
-        if (! $counselor || ! $this->isCounselor($counselor)) {
-            return response()->json(['message' => 'Recipient is not a counselor.'], 422);
+        if (! $peer) {
+            return response()->json(['message' => 'Recipient not found.'], 422);
         }
 
-        $conversationId = $this->conversationIdFor((int) $user->id, $counselorId);
+        $peerRole = null;
+
+        if ($this->isCounselor($peer)) {
+            $peerRole = 'counselor';
+        } elseif ($this->isAdmin($peer)) {
+            $peerRole = 'admin';
+        } else {
+            return response()->json(['message' => 'Recipient must be a counselor or admin.'], 422);
+        }
+
+        $conversationId = $this->conversationIdFor((int) $user->id, $peerRole, $peerId);
 
         $m = new Message();
         $m->user_id = (int) $user->id; // owner = referral user
@@ -330,8 +358,8 @@ class ReferralUserMessageController extends Controller
         $m->sender_id = (int) $user->id;
         $m->sender_name = $user->name ?? null;
 
-        $m->recipient_role = 'counselor';
-        $m->recipient_id = $counselorId;
+        $m->recipient_role = $peerRole;
+        $m->recipient_id = $peerId;
 
         // ✅ Always store canonical
         $m->conversation_id = $conversationId;
@@ -342,7 +370,7 @@ class ReferralUserMessageController extends Controller
         $m->is_read = true;
         $m->student_read_at = now();
 
-        // counselor hasn't read
+        // staff recipient hasn't read yet (use counselor_is_read for both counselor/admin recipients)
         $m->counselor_is_read = false;
         $m->counselor_read_at = null;
 
@@ -387,7 +415,11 @@ class ReferralUserMessageController extends Controller
                    ->orWhere('recipient_role', 'programchair');
             })
             ->where('recipient_id', (int) $user->id)
-            ->where('is_read', false);
+            ->where(function ($w) {
+                $w->where('is_read', false)
+                  ->orWhere('is_read', 0)
+                  ->orWhereNull('is_read');
+            });
 
         $ids = $data['message_ids'] ?? null;
         if (is_array($ids) && count($ids) > 0) {
@@ -407,7 +439,7 @@ class ReferralUserMessageController extends Controller
 
     /**
      * PATCH/PUT /referral-user/messages/{id}
-     * Referral user can only edit their OWN outgoing messages.
+     * Referral user can only edit their OWN outgoing messages (to counselor/admin).
      */
     public function update(Request $request, int $id): JsonResponse
     {
@@ -428,8 +460,8 @@ class ReferralUserMessageController extends Controller
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
-        // Also ensure it is a counselor conversation
-        if (strtolower((string) $m->recipient_role) !== 'counselor') {
+        $recRole = strtolower(trim((string) ($m->recipient_role ?? '')));
+        if (! in_array($recRole, ['counselor', 'admin'], true)) {
             return response()->json(['message' => 'Invalid message recipient.'], 422);
         }
 
@@ -449,7 +481,7 @@ class ReferralUserMessageController extends Controller
 
     /**
      * DELETE /referral-user/messages/{id}
-     * Referral user can only delete their OWN outgoing messages.
+     * Referral user can only delete their OWN outgoing messages (to counselor/admin).
      */
     public function destroy(Request $request, int $id): JsonResponse
     {
@@ -465,7 +497,8 @@ class ReferralUserMessageController extends Controller
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
-        if (strtolower((string) $m->recipient_role) !== 'counselor') {
+        $recRole = strtolower(trim((string) ($m->recipient_role ?? '')));
+        if (! in_array($recRole, ['counselor', 'admin'], true)) {
             return response()->json(['message' => 'Invalid message recipient.'], 422);
         }
 
