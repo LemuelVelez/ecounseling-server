@@ -38,12 +38,6 @@ Route::get('/', function () {
 |--------------------------------------------------------------------------|
 | ✅ FIX: Serve public storage files (avatars) reliably
 |--------------------------------------------------------------------------|
-|
-| If the storage symlink is missing in some environments, /storage/* will 404.
-| This route serves files from the "public" disk (storage/app/public).
-|
-| Frontend AvatarImage typically uses:
-|   /storage/avatars/xxx.jpg
 */
 Route::get('storage/{path}', function (Request $request, string $path) {
     $path = str_replace('\\', '/', $path);
@@ -396,7 +390,7 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
 
     $isAdmin = str_contains($actorRole, 'admin');
 
-    // ✅ FIX: referral-user (Dean/Registrar/Program Chair/referral_user) must be able to list students for referrals
+    // ✅ referral-user (Dean/Registrar/Program Chair/referral_user)
     $isReferralUser =
         $actorRole === 'referral_user' ||
         $actorRole === 'referral-user' ||
@@ -414,7 +408,10 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
     // ✅ Anyone authenticated may list counselors (needed by StudentMessages.tsx)
     if ($target === 'counselor') return true;
 
-    // ✅ FIX: allow referral-user to list STUDENTS only
+    // ✅ referral_user list is for counselor/admin only
+    if ($target === 'referral_user') return $isCounselor || $isAdmin;
+
+    // ✅ allow referral-user to list STUDENTS only
     if ($target === 'student') return $isCounselor || $isAdmin || $isReferralUser;
 
     // ✅ Only counselor/admin can list other roles
@@ -443,6 +440,18 @@ function applyDirectoryRoleFilter($query, string $role)
 
     if ($r === 'admin') {
         return $query->whereRaw('LOWER(role) LIKE ?', ['%admin%']);
+    }
+
+    // ✅ FIX: referral user directory filter (dean/registrar/program chair/referral_user)
+    if ($r === 'referral_user') {
+        return $query->where(function ($q) {
+            $q->whereRaw("LOWER(REPLACE(REPLACE(role,'-','_'),' ','_')) LIKE ?", ['%referral_user%'])
+              ->orWhereRaw("LOWER(role) LIKE ?", ['%dean%'])
+              ->orWhereRaw("LOWER(role) LIKE ?", ['%registrar%'])
+              ->orWhereRaw("LOWER(REPLACE(REPLACE(role,'-','_'),' ','_')) LIKE ?", ['%program_chair%'])
+              ->orWhereRaw("LOWER(role) LIKE ?", ['%program chair%'])
+              ->orWhereRaw("LOWER(role) LIKE ?", ['%programchair%']);
+        });
     }
 
     return $query->whereRaw('1 = 0');
@@ -511,14 +520,32 @@ function directoryNormalizeRolesFromRequest(Request $request): array
         'counsellors' => 'counselor',
         'guidance'    => 'counselor',
         'admins'      => 'admin',
+
+        // ✅ FIX: referral user aliases
+        'referral_user'  => 'referral_user',
+        'referral-users' => 'referral_user',
+        'referral_users' => 'referral_user',
+        'referralusers'  => 'referral_user',
+        'referral user'  => 'referral_user',
+        'referral'       => 'referral_user',
+        'dean'           => 'referral_user',
+        'registrar'      => 'referral_user',
+        'program_chair'  => 'referral_user',
+        'program chair'  => 'referral_user',
+        'programchair'   => 'referral_user',
     ];
 
-    $allowed = ['student', 'guest', 'counselor', 'admin'];
+    // ✅ FIX: allow referral_user
+    $allowed = ['student', 'guest', 'counselor', 'admin', 'referral_user'];
 
     $norm = [];
     foreach ($roles as $r) {
         $rr = strtolower(trim((string) $r));
         if ($rr === '') continue;
+
+        // normalize spaces/hyphens similarly
+        $rr = str_replace(['-', '  '], ['_', ' '], $rr);
+
         if (isset($map[$rr])) $rr = $map[$rr];
         if (! in_array($rr, $allowed, true)) continue;
         $norm[] = $rr;
@@ -689,6 +716,15 @@ Route::middleware(AuthenticateAnyGuard::class)->get('admins', function (Request 
     return directoryResponse($request, 'admin');
 });
 
+// ✅ NEW: referral user directory aliases (fixes /referral-users and /referral_users calls)
+Route::middleware(AuthenticateAnyGuard::class)->get('referral-users', function (Request $request) {
+    return directoryResponse($request, 'referral_user');
+})->name('directory.referral_users.hyphen');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('referral_users', function (Request $request) {
+    return directoryResponse($request, 'referral_user');
+})->name('directory.referral_users.underscore');
+
 Route::middleware(AuthenticateAnyGuard::class)->get('users', function (Request $request) {
     $roles = directoryNormalizeRolesFromRequest($request);
 
@@ -770,7 +806,6 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
     Route::get('messages', [AdminMessageController::class, 'index'])
         ->name('admin.messages.index');
 
-    // ✅ FIX: correct path (WAS accidentally /admin/admin/messages/mark-as-read)
     Route::post('messages/mark-as-read', [AdminMessageController::class, 'markAsRead'])
         ->name('admin.messages.markAsRead');
 
@@ -792,7 +827,6 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
     Route::delete('messages/{id}', [AdminMessageController::class, 'destroy'])
         ->whereNumber('id')
         ->name('admin.messages.destroy');
-
 });
 
 /*
@@ -801,4 +835,4 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
 |--------------------------------------------------------------------------|
 */
 Route::view('/{any}', 'welcome')
-    ->where('any', '^(?!storage|auth|notifications|messages|conversations|student|counselor|referral-user|admin|students|guests|counselors|admins|users|search).*$');
+    ->where('any', '^(?!storage|auth|notifications|messages|conversations|student|counselor|referral-user|referral-users|referral_users|admin|students|guests|counselors|admins|users|search).*$');

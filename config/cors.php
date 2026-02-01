@@ -6,7 +6,6 @@ return [
     |--------------------------------------------------------------------------
     | Cross-Origin Resource Sharing (CORS) Configuration
     |--------------------------------------------------------------------------
-    |
     */
 
     // ✅ Enable CORS on ALL routes your SPA may call (including referral-user).
@@ -21,6 +20,12 @@ return [
         // ✅ referral-user APIs
         'referral-user',
         'referral-user/*',
+
+        // ✅ FIX: alias endpoints the frontend is calling
+        'referral-users',
+        'referral-users/*',
+        'referral_users',
+        'referral_users/*',
 
         // ✅ FIX: add search alias paths (so /search/users won't be blocked by browser)
         'search/*',
