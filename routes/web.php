@@ -107,7 +107,7 @@ Route::prefix('auth')->group(function () {
 | ✅ Notification counts endpoint (badges)
 |--------------------------------------------------------------------------|
 */
-Route::get('notifications/counts', [NotificationController::class, 'counts'])
+Route::middleware(AuthenticateAnyGuard::class)->get('notifications/counts', [NotificationController::class, 'counts'])
     ->name('notifications.counts');
 
 /*
@@ -348,9 +348,6 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('referral-user')->group(f
     /*
     |--------------------------------------------------------------------------|
     | ✅ FIX: Referral-user student directory endpoints to stop 404s
-    | Frontend tries:
-    | - GET /referral-user/students?search=
-    | - GET /referral-user/users?role=student&search=
     |--------------------------------------------------------------------------|
     */
     Route::get('students', function (Request $request) {
@@ -711,10 +708,6 @@ Route::middleware(AuthenticateAnyGuard::class)->get('users', function (Request $
 /*
 |--------------------------------------------------------------------------|
 | ✅ FIX: Alias routes to stop 404 + CORS issues from older frontend calls
-| Frontend previously tried:
-| - /students/search?q=
-| - /users/search?role=student&q=
-| - /search/users?role=student&q=
 |--------------------------------------------------------------------------|
 */
 Route::middleware(AuthenticateAnyGuard::class)->get('students/search', function (Request $request) {
@@ -777,6 +770,10 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
     Route::get('messages', [AdminMessageController::class, 'index'])
         ->name('admin.messages.index');
 
+    // ✅ FIX (405): enable POST /admin/messages
+    Route::post('messages', [AdminMessageController::class, 'store'])
+        ->name('admin.messages.store');
+
     Route::get('messages/conversations/{conversationId}', [AdminMessageController::class, 'showConversation'])
         ->where('conversationId', '.+')
         ->name('admin.messages.conversations.show');
@@ -793,3 +790,11 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
         ->whereNumber('id')
         ->name('admin.messages.destroy');
 });
+
+/*
+|--------------------------------------------------------------------------|
+| ✅ SPA fallback (React Router refresh support)
+|--------------------------------------------------------------------------|
+*/
+Route::view('/{any}', 'welcome')
+    ->where('any', '^(?!storage|auth|notifications|messages|conversations|student|counselor|referral-user|admin|students|guests|counselors|admins|users|search).*$');

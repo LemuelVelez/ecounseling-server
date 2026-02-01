@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\IntakeRequest;
+use App\Models\Message;
 use App\Models\Referral;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -20,6 +21,15 @@ class NotificationController extends Controller
         return str_contains($role, 'counselor')
             || str_contains($role, 'counsellor')
             || str_contains($role, 'guidance');
+    }
+
+    private function isAdmin(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+
+        return str_contains($role, 'admin');
     }
 
     private function isReferralUser(?User $user): bool
@@ -97,11 +107,42 @@ class NotificationController extends Controller
     }
 
     /**
+     * Fallback unread conversations counter (used if badge controller returns 0 for certain roles).
+     * Counts DISTINCT conversation_id where this user is the recipient and is_read=false.
+     */
+    private function fallbackUnreadConversationsByRecipient(User $user, array $recipientRoleNeedles): int
+    {
+        $uid = (string) $user->id;
+
+        $q = Message::query()
+            ->whereNotNull('conversation_id')
+            ->where('conversation_id', '!=', '')
+            ->whereNotNull('recipient_id')
+            ->whereRaw('CAST(recipient_id AS CHAR) = ?', [$uid])
+            ->where(function ($w) use ($recipientRoleNeedles) {
+                // if recipient_role is null, still allow (some legacy rows may not set it)
+                $w->whereNull('recipient_role');
+
+                foreach ($recipientRoleNeedles as $needle) {
+                    $needle = strtolower(trim((string) $needle));
+                    if ($needle === '') continue;
+                    $w->orWhereRaw('LOWER(COALESCE(recipient_role, \'\')) LIKE ?', ['%' . $needle . '%']);
+                }
+            })
+            ->where(function ($w) {
+                $w->where('is_read', false)
+                  ->orWhere('is_read', 0)
+                  ->orWhereNull('is_read');
+            });
+
+        // distinct conversation threads
+        return (int) $q->distinct('conversation_id')->count('conversation_id');
+    }
+
+    /**
      * GET /notifications/counts
      *
-     * ✅ IMPORTANT:
-     * - This route is NOT behind auth middleware (see routes/web.php).
-     * - If unauthenticated, return 200 with zero counts (no console spam).
+     * ✅ Returns 200 with zero counts if unauthenticated (prevents console spam).
      */
     public function counts(Request $request): JsonResponse
     {
@@ -144,7 +185,42 @@ class NotificationController extends Controller
                     ->where('status', 'pending')
                     ->count();
             });
+        } elseif ($this->isAdmin($user)) {
+            // ✅ Admin should also see unread message badge
+            $unreadMessages = $this->safeCount(function () use ($user) {
+                return MessageBadgeCountController::unreadConversationCountFor($user);
+            });
+
+            // Fallback if badge controller doesn't count admin properly yet
+            if ($unreadMessages <= 0) {
+                $unreadMessages = $this->safeCount(function () use ($user) {
+                    return $this->fallbackUnreadConversationsByRecipient($user, ['admin']);
+                });
+            }
+
+            $pendingAppointments = 0;
+            $newReferrals = 0;
         } elseif ($this->isReferralUser($user)) {
+            // ✅ FIX: Referral users can receive messages too, so unread badge must work
+            $unreadMessages = $this->safeCount(function () use ($user) {
+                return MessageBadgeCountController::unreadConversationCountFor($user);
+            });
+
+            // Fallback for legacy recipient_role values (dean/registrar/program_chair)
+            if ($unreadMessages <= 0) {
+                $unreadMessages = $this->safeCount(function () use ($user) {
+                    return $this->fallbackUnreadConversationsByRecipient($user, [
+                        'referral_user',
+                        'referral user',
+                        'dean',
+                        'registrar',
+                        'program_chair',
+                        'program chair',
+                        'programchair',
+                    ]);
+                });
+            }
+
             $newReferrals = $this->safeCount(function () use ($user) {
                 return Referral::query()
                     ->where('requested_by_id', (int) $user->id)
@@ -152,9 +228,9 @@ class NotificationController extends Controller
                     ->count();
             });
 
-            $unreadMessages = 0;
             $pendingAppointments = 0;
         } else {
+            // student/guest (and any other non-counselor roles)
             $unreadMessages = $this->safeCount(function () use ($user) {
                 return MessageBadgeCountController::unreadConversationCountFor($user);
             });
