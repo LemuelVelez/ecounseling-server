@@ -122,6 +122,114 @@ class ReferralController extends Controller
         return str_contains($studentRole, 'student');
     }
 
+    /*
+     |--------------------------------------------------------------------------
+     | ✅ Student referrals (FIX for /student/referrals 404 + legacy aliases)
+     |--------------------------------------------------------------------------
+     */
+
+    /**
+     * GET /student/referrals
+     * GET /student/referrals/list
+     * GET /students/referrals
+     * GET /students/referrals/list
+     * GET /referrals/student
+     * GET /referrals/mine
+     *
+     * Returns referrals where referrals.student_id = current user's id.
+     */
+    public function studentIndex(Request $request): JsonResponse
+    {
+        $actor = $request->user();
+
+        if (! $actor) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        if (! $this->isStudent($actor)) {
+            return response()->json(['message' => 'Forbidden.'], 403);
+        }
+
+        try {
+            $perPage = (int) ($request->query('per_page', $request->query('limit', 10)));
+            if ($perPage < 1) $perPage = 10;
+            if ($perPage > 100) $perPage = 100;
+
+            $status = trim((string) $request->query('status', ''));
+            $status = $status !== '' ? strtolower($status) : null;
+
+            $q = Referral::query()
+                ->where('student_id', (int) $actor->id)
+                ->with($this->referralWith())
+                ->orderByDesc('created_at')
+                ->orderByDesc('id');
+
+            if ($status && $status !== 'all') {
+                $q->where('status', $status);
+            }
+
+            $p = $q->paginate($perPage);
+
+            return response()->json([
+                'message' => 'Fetched your referrals.',
+                'referrals' => $p->items(),
+                'meta' => [
+                    'current_page' => $p->currentPage(),
+                    'per_page' => $p->perPage(),
+                    'total' => $p->total(),
+                    'last_page' => $p->lastPage(),
+                ],
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to fetch your referrals.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * GET /student/referrals/{id}
+     * GET /students/referrals/{id}
+     *
+     * Student can only view their own referral.
+     */
+    public function studentShow(Request $request, int $id): JsonResponse
+    {
+        $actor = $request->user();
+
+        if (! $actor) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        if (! $this->isStudent($actor)) {
+            return response()->json(['message' => 'Forbidden.'], 403);
+        }
+
+        try {
+            $ref = Referral::query()
+                ->with($this->referralWith())
+                ->find($id);
+
+            if (! $ref) {
+                return response()->json(['message' => 'Referral not found.'], 404);
+            }
+
+            if ((int) $ref->student_id !== (int) $actor->id) {
+                return response()->json(['message' => 'Forbidden.'], 403);
+            }
+
+            return response()->json([
+                'referral' => $ref,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to fetch referral.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
     /**
      * POST /referral-user/referrals
      */

@@ -186,9 +186,51 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('student')->group(functio
     Route::post('messages/mark-as-read', [StudentMessageController::class, 'markAsRead'])
         ->name('student.messages.markAsRead');
 
+    /*
+    |--------------------------------------------------------------------------|
+    | ✅ Referral module endpoints (student side)  (FIXES 404 on /student/referrals*)
+    |--------------------------------------------------------------------------|
+    */
+    Route::get('referrals', [ReferralController::class, 'studentIndex'])
+        ->name('student.referrals.index');
+
+    // alias used by some frontends
+    Route::get('referrals/list', [ReferralController::class, 'studentIndex'])
+        ->name('student.referrals.list');
+
+    Route::get('referrals/{id}', [ReferralController::class, 'studentShow'])
+        ->whereNumber('id')
+        ->name('student.referrals.show');
+
     Route::post('profile/avatar', [StudentProfileController::class, 'updateAvatar'])
         ->name('student.profile.avatar');
 });
+
+/*
+|--------------------------------------------------------------------------|
+| ✅ Legacy alias routes for student referrals (older frontend candidates)
+|--------------------------------------------------------------------------|
+*/
+Route::middleware(AuthenticateAnyGuard::class)->get('students/referrals', [ReferralController::class, 'studentIndex'])
+    ->name('students.referrals.index.alias');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('students/referrals/list', [ReferralController::class, 'studentIndex'])
+    ->name('students.referrals.list.alias');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('students/referrals/{id}', [ReferralController::class, 'studentShow'])
+    ->whereNumber('id')
+    ->name('students.referrals.show.alias');
+
+/*
+|--------------------------------------------------------------------------|
+| ✅ Legacy alias routes to stop CORS/404 on /referrals/student + /referrals/mine
+|--------------------------------------------------------------------------|
+*/
+Route::middleware(AuthenticateAnyGuard::class)->get('referrals/student', [ReferralController::class, 'studentIndex'])
+    ->name('referrals.student.alias');
+
+Route::middleware(AuthenticateAnyGuard::class)->get('referrals/mine', [ReferralController::class, 'studentIndex'])
+    ->name('referrals.mine.alias');
 
 /*
 |--------------------------------------------------------------------------|
@@ -842,4 +884,4 @@ Route::middleware(AuthenticateAnyGuard::class)->prefix('admin')->group(function 
 |--------------------------------------------------------------------------|
 */
 Route::view('/{any}', 'welcome')
-    ->where('any', '^(?!storage|auth|notifications|messages|conversations|student|counselor|referral-user|referral-users|referral_users|admin|students|guests|counselors|admins|users|search).*$');
+    ->where('any', '^(?!storage|auth|notifications|messages|conversations|referrals|student|counselor|referral-user|referral-users|referral_users|admin|students|guests|counselors|admins|users|search).*$');

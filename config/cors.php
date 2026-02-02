@@ -27,6 +27,10 @@ return [
         'messages/*',
         'conversations/*',
 
+        // ✅ referrals (legacy + aliases like /referrals/mine, /referrals/student)
+        'referrals',
+        'referrals/*',
+
         // role modules
         'student/*',
         'counselor/*',
