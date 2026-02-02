@@ -6,67 +6,65 @@ return [
     |--------------------------------------------------------------------------
     | Cross-Origin Resource Sharing (CORS) Configuration
     |--------------------------------------------------------------------------
+    |
+    | Your frontend is calling Laravel routes defined in routes/web.php
+    | (NOT only /api/*), so make sure those paths are included here.
+    |
     */
 
-    // ✅ Enable CORS on ALL routes your SPA may call (including referral-user).
     'paths' => [
+        // default
+        'api/*',
+        'sanctum/csrf-cookie',
+
+        // auth
         'auth/*',
 
-        // message APIs
+        // notifications / badges
+        'notifications/*',
+
+        // messages + conversations
+        'messages/*',
+        'conversations/*',
+
+        // role modules
         'student/*',
         'counselor/*',
         'admin/*',
-
-        // ✅ referral-user APIs
-        'referral-user',
         'referral-user/*',
 
-        // ✅ FIX: alias endpoints the frontend is calling
+        // ✅ directory endpoints (needed so referral-user can search admins/counselors)
+        'students',
+        'students/*',
+        'guests',
+        'guests/*',
+        'counselors',
+        'counselors/*',
+        'admins',
+        'admins/*',
+        'users',
+        'users/*',
+        'search/*',
+
+        // ✅ aliases used by older frontend builds
+        'referral-user',
+        'referral-user/*',
         'referral-users',
         'referral-users/*',
         'referral_users',
         'referral_users/*',
 
-        // ✅ FIX: add search alias paths (so /search/users won't be blocked by browser)
-        'search/*',
-
-        // ✅ notifications endpoint (badges)
-        'notifications',
-        'notifications/*',
-
-        // ✅ conversation/thread delete endpoints used by the frontend
-        'messages',
-        'messages/*',
-        'conversations',
-        'conversations/*',
-
-        // ✅ directory/list endpoints your frontend is calling
-        'users',
-        'users/*',
-
-        'students',
-        'students/*',
-
-        'counselors',
-        'counselors/*',
-
-        'guests',
-        'guests/*',
-
-        // ✅ admins directory/list endpoints
-        'admins',
-        'admins/*',
-
-        'sanctum/csrf-cookie',
+        // public files
+        'storage/*',
     ],
 
     'allowed_methods' => ['*'],
 
-    // IMPORTANT: when using credentials, you CANNOT use "*".
-    'allowed_origins' => [
-        env('FRONTEND_URL', 'http://localhost:5173'),
-        'http://127.0.0.1:5173',
-    ],
+    // ✅ supports_credentials=true cannot be used with "*" origins
+    'allowed_origins' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', env('FRONTEND_URL', 'http://localhost:5173,http://127.0.0.1:5173'))
+    ))),
 
     'allowed_origins_patterns' => [],
 
@@ -76,6 +74,6 @@ return [
 
     'max_age' => 0,
 
-    // Required because your fetch uses `credentials: "include"`
     'supports_credentials' => true,
+
 ];

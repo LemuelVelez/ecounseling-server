@@ -408,6 +408,9 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
     // ✅ Anyone authenticated may list counselors (needed by StudentMessages.tsx)
     if ($target === 'counselor') return true;
 
+    // ✅ FIX: allow referral-user to search admins (needed for referral-user messaging UI)
+    if ($target === 'admin') return $isCounselor || $isAdmin || $isReferralUser;
+
     // ✅ referral_user list is for counselor/admin only
     if ($target === 'referral_user') return $isCounselor || $isAdmin;
 

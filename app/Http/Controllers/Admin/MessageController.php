@@ -9,6 +9,8 @@ use App\Models\User;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class MessageController extends Controller
 {
@@ -41,7 +43,7 @@ class MessageController extends Controller
         if (str_contains($r, 'guest')) return 'guest';
 
         // ✅ referral office roles
-        if (in_array($r, ['referral_user', 'referraluser', 'referral', 'dean', 'registrar', 'program_chair', 'programchair'], true)) {
+        if (in_array($r, ['referral_user', 'referraluser', 'referral', 'referral_users', 'referralusers', 'dean', 'registrar', 'program_chair', 'programchair'], true)) {
             return 'referral_user';
         }
 
@@ -52,13 +54,13 @@ class MessageController extends Controller
 
     /**
      * SQL role normalization for conversation canonicalization.
-     * Produces canonical: counselor/admin/student/guest/referral_user/system/other.
      */
     private function roleSql(string $col): string
     {
         $base = "LOWER(REPLACE(REPLACE({$col},'-','_'),' ','_'))";
 
-        return "
+        // ✅ Wrap in parentheses so it is always a clean SQL expression
+        return "(
             CASE
                 WHEN {$base} LIKE '%counselor%' OR {$base} LIKE '%counsellor%' OR {$base} LIKE '%guidance%' THEN 'counselor'
                 WHEN {$base} LIKE '%admin%' OR {$base} IN ('administrator','superadmin','super_admin') THEN 'admin'
@@ -68,12 +70,54 @@ class MessageController extends Controller
                 WHEN {$base} = 'system' THEN 'system'
                 ELSE {$base}
             END
-        ";
+        )";
     }
 
     /**
-     * Canonical conversation id generator (PHP-side, used when storing).
-     * ✅ Matches canonicalConversationExpr().
+     * Choose the correct "admin read" column if the DB has one,
+     * otherwise fall back to `is_read`.
+     */
+    private function adminReadColumnName(): string
+    {
+        try {
+            if (Schema::hasColumn('messages', 'admin_is_read')) return 'admin_is_read';
+            if (Schema::hasColumn('messages', 'is_read_by_admin')) return 'is_read_by_admin';
+            if (Schema::hasColumn('messages', 'read_by_admin')) return 'read_by_admin';
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return 'is_read';
+    }
+
+    /**
+     * DB-safe CAST target for "read flag" checks.
+     * - pgsql/sqlite: TEXT
+     * - mysql: CHAR
+     */
+    private function castTextType(): string
+    {
+        $driver = (string) DB::getDriverName();
+        if ($driver === 'pgsql' || $driver === 'sqlite') return 'TEXT';
+        if ($driver === 'sqlsrv') return 'NVARCHAR(10)';
+        return 'CHAR';
+    }
+
+    /**
+     * ✅ DB-safe "unread" predicate that works for:
+     * - boolean columns (false/true)
+     * - tinyint columns (0/1)
+     * - null (treated as unread)
+     */
+    private function unreadFlagPredicateSql(string $colSql): string
+    {
+        $cast = $this->castTextType();
+        $expr = "COALESCE(CAST({$colSql} AS {$cast}), '0')";
+        return "{$expr} IN ('0','false','f')";
+    }
+
+    /**
+     * Canonical conversation id generator (PHP-side) used when storing.
      */
     private function canonicalConversationIdForPeer(string $peerRole, $peerId): string
     {
@@ -83,46 +127,31 @@ class MessageController extends Controller
 
         if ($id === '') return '';
 
-        // student + guest share one canonical prefix (as designed)
+        // student + guest share one canonical prefix
         if ($role === 'student' || $role === 'guest') return "student-{$id}";
 
         // referral_user canonical uses underscore (frontend-safe)
         if ($role === 'referral_user') return "referral_user-{$id}";
 
-        // general fallback (counselor/admin/other)
         return "{$role}-{$id}";
     }
 
     /**
-     * SQL expression that produces a CANONICAL conversation id across legacy thread ids.
-     *
-     * ✅ Goal:
-     * - Admin inbox groups by the *peer* (non-admin) id, regardless of which side sent the message.
-     * - Student/Guest canonical: student-{id}
-     * - Referral user canonical: referral_user-{id}
-     * - Others: {role}-{id}
-     * - Else fallback to messages.conversation_id or msg-{id}
+     * ✅ CRITICAL FIX:
+     * Canonical conversation id expression FROM THE ADMIN VIEWPOINT.
      */
-    private function canonicalConversationExpr(string $alias = 'messages'): string
+    private function canonicalConversationExprForAdmin(User $actor, string $alias = 'messages'): string
     {
         $t = $alias;
 
         $senderRole = $this->roleSql("{$t}.sender");
         $recipientRole = $this->roleSql("{$t}.recipient_role");
 
+        $aid = (int) $actor->id;
+
         return "
             CASE
-                -- ✅ Admin is sender => key by recipient (peer)
-                WHEN ({$senderRole} = 'admin' AND {$t}.sender_id IS NOT NULL AND {$t}.recipient_id IS NOT NULL)
-                    THEN
-                        CASE
-                            WHEN {$recipientRole} IN ('student','guest') THEN CONCAT('student-', {$t}.recipient_id)
-                            WHEN {$recipientRole} = 'referral_user' THEN CONCAT('referral_user-', {$t}.recipient_id)
-                            ELSE CONCAT({$recipientRole}, '-', {$t}.recipient_id)
-                        END
-
-                -- ✅ Admin is recipient => key by sender (peer)
-                WHEN ({$recipientRole} = 'admin' AND {$t}.recipient_id IS NOT NULL AND {$t}.sender_id IS NOT NULL)
+                WHEN ({$t}.recipient_id = {$aid} AND {$t}.sender_id IS NOT NULL)
                     THEN
                         CASE
                             WHEN {$senderRole} IN ('student','guest') THEN CONCAT('student-', {$t}.sender_id)
@@ -130,7 +159,22 @@ class MessageController extends Controller
                             ELSE CONCAT({$senderRole}, '-', {$t}.sender_id)
                         END
 
-                -- Legacy canonicalization (kept for safety)
+                WHEN ({$t}.sender_id = {$aid} AND {$t}.recipient_id IS NOT NULL)
+                    THEN
+                        CASE
+                            WHEN {$recipientRole} IN ('student','guest') THEN CONCAT('student-', {$t}.recipient_id)
+                            WHEN {$recipientRole} = 'referral_user' THEN CONCAT('referral_user-', {$t}.recipient_id)
+                            ELSE CONCAT({$recipientRole}, '-', {$t}.recipient_id)
+                        END
+
+                WHEN ({$recipientRole} = 'admin' AND {$t}.recipient_id IS NULL AND {$t}.sender_id IS NOT NULL)
+                    THEN
+                        CASE
+                            WHEN {$senderRole} IN ('student','guest') THEN CONCAT('student-', {$t}.sender_id)
+                            WHEN {$senderRole} = 'referral_user' THEN CONCAT('referral_user-', {$t}.sender_id)
+                            ELSE CONCAT({$senderRole}, '-', {$t}.sender_id)
+                        END
+
                 WHEN {$senderRole} IN ('student','guest') AND {$t}.sender_id IS NOT NULL
                     THEN CONCAT('student-', {$t}.sender_id)
                 WHEN {$recipientRole} IN ('student','guest') AND {$t}.recipient_id IS NOT NULL
@@ -155,28 +199,98 @@ class MessageController extends Controller
         $recipientRole = $this->roleSql("{$alias}.recipient_role");
 
         $query->where(function ($q) use ($actor, $alias, $senderRole, $recipientRole) {
-            $q->whereRaw("{$senderRole} = 'admin' AND {$alias}.sender_id = ?", [$actor->id])
-              ->orWhereRaw("{$recipientRole} = 'admin' AND {$alias}.recipient_id = ?", [$actor->id]);
+            // Admin sent
+            $q->whereRaw("({$senderRole}) = 'admin' AND {$alias}.sender_id = ?", [$actor->id])
+
+                // Admin received (direct OR broadcast-to-admin)
+                ->orWhere(function ($q2) use ($actor, $alias, $recipientRole) {
+                    $q2->whereRaw("({$recipientRole}) = 'admin'")
+                        ->where(function ($q3) use ($actor, $alias) {
+                            $q3->where("{$alias}.recipient_id", "=", $actor->id)
+                                ->orWhereNull("{$alias}.recipient_id");
+                        });
+                })
+
+                // ✅ Robust: if recipient_id == this admin, include it regardless of recipient_role
+                ->orWhere(function ($q2) use ($actor, $alias) {
+                    $q2->where("{$alias}.recipient_id", "=", $actor->id);
+                });
         });
     }
 
     /**
-     * Map a Message model to the DTO shape used by your frontend.
+     * Apply per-user conversation delete/hide logic.
      */
-    private function messageToDto(Message $m, string $conversationId): array
+    private function applyConversationDeletionFilter($query, User $actor, string $conversationExpr, string $alias = 'messages'): void
     {
-        $senderName = $m->senderUser?->name ?: ($m->sender_name ?: null);
+        $query->leftJoin('message_conversation_deletions as mcd', function ($join) use ($actor, $conversationExpr) {
+            $join->on(DB::raw($conversationExpr), '=', 'mcd.conversation_id')
+                ->where('mcd.user_id', '=', (int) $actor->id);
+        });
 
-        $senderNormalized = $this->normalizeRole($m->sender);
-        $recipientRoleNormalized = $this->normalizeRole($m->recipient_role);
+        $query->where(function ($q) use ($alias) {
+            $q->whereNull('mcd.deleted_at')
+                ->orWhereColumn("{$alias}.created_at", '>', 'mcd.deleted_at');
+        });
+    }
+
+    private function messagesHasSoftDeletes(): bool
+    {
+        try {
+            return Schema::hasColumn('messages', 'deleted_at');
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Determine "owner/peer" (the non-admin side) for admin UI.
+     */
+    private function computeOwnerForAdmin(User $actor, Message $m): array
+    {
+        $senderRole = $this->normalizeRole($m->sender);
+        $recipientRole = $this->normalizeRole($m->recipient_role);
+
+        $actorId = (string) $actor->id;
+        $senderId = $m->sender_id != null ? (string) $m->sender_id : null;
+        $recipientId = $m->recipient_id != null ? (string) $m->recipient_id : null;
+
+        // If actor sent, peer is recipient
+        if ($senderId && $senderId === $actorId) {
+            $peerId = $recipientId;
+            $peerRole = $recipientRole;
+            $peerUser = $m->recipientUser;
+            $peerName = $peerUser?->name ?? $m->recipient_name ?? null;
+
+            return [$peerId, $peerRole, $peerUser, $peerName];
+        }
+
+        // If actor received (or broadcast-to-admin), peer is sender
+        $peerId = $senderId;
+        $peerRole = $senderRole;
+        $peerUser = $m->senderUser;
+        $peerName = $peerUser?->name ?? $m->sender_name ?? null;
+
+        return [$peerId, $peerRole, $peerUser, $peerName];
+    }
+
+    /**
+     * Map Message model to DTO shape expected by frontend.
+     */
+    private function messageToDto(User $actor, Message $m, string $conversationId): array
+    {
+        [$ownerId, $ownerRole, $ownerUser, $ownerName] = $this->computeOwnerForAdmin($actor, $m);
+
+        $senderName = $m->senderUser?->name ?: ($m->sender_name ?: null);
 
         return [
             'id' => $m->id,
             'conversation_id' => $conversationId,
             'content' => $m->content,
             'created_at' => optional($m->created_at)->toISOString(),
+            'updated_at' => optional($m->updated_at)->toISOString(),
 
-            'sender' => $senderNormalized,
+            'sender' => $this->normalizeRole($m->sender),
             'sender_id' => $m->sender_id,
             'sender_name' => $senderName,
             'sender_email' => $m->senderUser?->email,
@@ -184,162 +298,147 @@ class MessageController extends Controller
             'sender_avatar_url' => $m->senderUser?->avatar_url,
 
             'recipient_id' => $m->recipient_id,
-            'recipient_role' => $recipientRoleNormalized,
-            'recipient_name' => $m->recipientUser?->name,
+            'recipient_role' => $this->normalizeRole($m->recipient_role),
+            'recipient_name' => $m->recipientUser?->name ?? $m->recipient_name,
             'recipient_email' => $m->recipientUser?->email,
             'recipient_user_role' => $m->recipientUser?->role,
             'recipient_avatar_url' => $m->recipientUser?->avatar_url,
 
-            'owner_user_id' => $m->user_id,
-            'owner_name' => $m->user?->name,
-            'owner_email' => $m->user?->email,
-            'owner_role' => $m->user?->role,
-            'owner_avatar_url' => $m->user?->avatar_url,
+            'owner_user_id' => $ownerId,
+            'owner_name' => $ownerName,
+            'owner_email' => $ownerUser?->email,
+            'owner_role' => $ownerUser?->role ?? $ownerRole,
+            'owner_avatar_url' => $ownerUser?->avatar_url,
 
-            'is_read' => (bool) $m->is_read,
-            'counselor_is_read' => (bool) $m->counselor_is_read,
-            'student_read_at' => optional($m->student_read_at)->toISOString(),
-            'counselor_read_at' => optional($m->counselor_read_at)->toISOString(),
+            'is_read' => $m->is_read,
+            'counselor_is_read' => $m->counselor_is_read ?? null,
+
+            'admin_is_read' => $m->admin_is_read ?? null,
+            'is_read_by_admin' => $m->is_read_by_admin ?? null,
+            'read_by_admin' => $m->read_by_admin ?? null,
         ];
     }
 
     /**
      * GET /admin/messages
-     * List conversations (one row per CANONICAL conversation id) using the latest message.
+     *
+     * ✅ FIX:
+     * - avoids window functions (ROW_NUMBER / SUM OVER)
+     * - uses GROUP BY conversation + MAX(last_id) + SUM(unread_case)
+     * - unread check is DB-safe (boolean/int/null)
      */
     public function index(Request $request): JsonResponse
     {
-        /** @var User|null $actor */
         $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
 
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
+        $page = max(1, (int) $request->query('page', 1));
+        $perPage = (int) $request->query('per_page', 50);
+        $perPage = max(1, min(200, $perPage));
+
+        $search = trim((string) $request->query('search', ''));
+
+        $conversationExpr = $this->canonicalConversationExprForAdmin($actor, 'messages');
+
+        $readCol = $this->adminReadColumnName();
+        $readColSql = "messages.{$readCol}";
+
+        $recipientRoleSql = $this->roleSql('messages.recipient_role');
+
+        $unreadPredicate = $this->unreadFlagPredicateSql($readColSql);
+
+        $uid = (int) $actor->id;
+
+        // unread case: addressed to this admin OR broadcast admin AND not read
+        $unreadCaseSql = "
+            CASE
+                WHEN (
+                    (
+                        messages.recipient_id = {$uid}
+                        OR (messages.recipient_id IS NULL AND ({$recipientRoleSql}) = 'admin')
+                    )
+                    AND ({$unreadPredicate})
+                ) THEN 1 ELSE 0 END
+        ";
+
+        $q = DB::table('messages')
+            ->selectRaw("{$conversationExpr} as conversation_id")
+            ->selectRaw("MAX(messages.id) as last_id")
+            ->selectRaw("MAX(messages.created_at) as last_created_at")
+            ->selectRaw("SUM({$unreadCaseSql}) as unread_count");
+
+        // exclude soft-deleted messages if the column exists (DB::table doesn't auto-apply SoftDeletes)
+        if ($this->messagesHasSoftDeletes()) {
+            $q->whereNull('messages.deleted_at');
         }
 
-        $perPageRaw = (int) $request->query('per_page', $request->query('limit', 20));
-        $perPage = $perPageRaw < 1 ? 20 : ($perPageRaw > 100 ? 100 : $perPageRaw);
+        // participation + deletions
+        $this->applyAdminParticipationFilter($q, $actor, 'messages');
+        $this->applyConversationDeletionFilter($q, $actor, $conversationExpr, 'messages');
 
-        $search = trim((string) $request->query('search', $request->query('q', $request->query('query', ''))));
-
-        $expr = $this->canonicalConversationExpr('messages');
-
-        // Latest message id per canonical conversation id (only conversations involving THIS admin)
-        $latestPerConversation = Message::query()
-            ->selectRaw("{$expr} as canonical_conversation_id, MAX(id) as last_id");
-
-        $this->applyAdminParticipationFilter($latestPerConversation, $actor, 'messages');
-
-        $latestPerConversation->groupByRaw($expr);
-
-        $query = Message::query()
-            ->joinSub($latestPerConversation, 'last', function ($join) {
-                $join->on('messages.id', '=', 'last.last_id');
-            })
-            ->leftJoin('users as sender_u', 'sender_u.id', '=', 'messages.sender_id')
-            ->leftJoin('users as recipient_u', 'recipient_u.id', '=', 'messages.recipient_id')
-            ->leftJoin('users as owner_u', 'owner_u.id', '=', 'messages.user_id')
-            ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($actor) {
-                $join->on('mcd.conversation_id', '=', 'last.canonical_conversation_id')
-                    ->where('mcd.user_id', '=', $actor->id);
-            })
-            ->where(function ($q) {
-                $q->whereNull('mcd.id')
-                  ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
-            })
-            ->select([
-                'messages.*',
-                'last.canonical_conversation_id as canonical_conversation_id',
-
-                'sender_u.name as sender_user_name',
-                'sender_u.email as sender_user_email',
-                'sender_u.role as sender_user_role',
-                'sender_u.avatar_url as sender_user_avatar',
-
-                'recipient_u.name as recipient_user_name',
-                'recipient_u.email as recipient_user_email',
-                'recipient_u.role as recipient_user_role',
-                'recipient_u.avatar_url as recipient_user_avatar',
-
-                'owner_u.name as owner_user_name',
-                'owner_u.email as owner_user_email',
-                'owner_u.role as owner_user_role',
-                'owner_u.avatar_url as owner_user_avatar',
-            ])
-            ->orderByDesc('messages.created_at')
-            ->orderByDesc('messages.id');
-
+        // Optional search (best-effort)
         if ($search !== '') {
-            $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $search) . '%';
+            $q->leftJoin('users as su', 'messages.sender_id', '=', 'su.id');
+            $q->leftJoin('users as ru', 'messages.recipient_id', '=', 'ru.id');
 
-            $query->where(function ($q) use ($like, $search) {
-                $q->where('messages.content', 'like', $like)
-                  ->orWhere('messages.sender_name', 'like', $like)
-                  ->orWhere('sender_u.name', 'like', $like)
-                  ->orWhere('sender_u.email', 'like', $like)
-                  ->orWhere('recipient_u.name', 'like', $like)
-                  ->orWhere('recipient_u.email', 'like', $like)
-                  ->orWhere('owner_u.name', 'like', $like)
-                  ->orWhere('owner_u.email', 'like', $like)
-                  ->orWhere('last.canonical_conversation_id', 'like', $like);
+            $like = '%' . str_replace(['%','_'], ['\%','\_'], $search) . '%';
+
+            $q->where(function ($w) use ($like, $search) {
+                $w->where('messages.content', 'like', $like)
+                    ->orWhere('messages.sender_name', 'like', $like)
+                    ->orWhere('messages.recipient_name', 'like', $like)
+                    ->orWhere('su.name', 'like', $like)
+                    ->orWhere('ru.name', 'like', $like);
 
                 if (ctype_digit($search)) {
-                    $id = (int) $search;
-                    $q->orWhere('messages.sender_id', $id)
-                      ->orWhere('messages.recipient_id', $id)
-                      ->orWhere('messages.user_id', $id);
+                    $w->orWhere('messages.id', '=', (int) $search)
+                      ->orWhere('messages.sender_id', '=', (int) $search)
+                      ->orWhere('messages.recipient_id', '=', (int) $search);
                 }
             });
         }
 
-        $paginator = $query->paginate($perPage);
+        $q->groupBy(DB::raw($conversationExpr))
+          ->orderByDesc('last_created_at')
+          ->orderByDesc('last_id');
 
-        $conversations = collect($paginator->items())->map(function ($m) {
-            $canonicalId = (string) ($m->canonical_conversation_id ?? $m->conversation_id);
+        $paginator = $q->paginate($perPage, ['*'], 'page', $page);
 
-            $senderName = $m->sender_user_name ?: ($m->sender_name ?: null);
-            $recipientName = $m->recipient_user_name ?: null;
+        $lastIds = [];
+        foreach ($paginator->items() as $row) {
+            if (isset($row->last_id)) $lastIds[] = (int) $row->last_id;
+        }
+        $lastIds = array_values(array_unique(array_filter($lastIds)));
 
-            $senderNormalized = $this->normalizeRole($m->sender);
-            $recipientRoleNormalized = $this->normalizeRole($m->recipient_role);
+        $messages = Message::query()
+            ->with([
+                'senderUser:id,name,email,role,avatar_url',
+                'recipientUser:id,name,email,role,avatar_url',
+            ])
+            ->whereIn('id', $lastIds)
+            ->get()
+            ->keyBy('id');
 
-            return [
-                'conversation_id' => $canonicalId,
-                'last_message' => [
-                    'id' => $m->id,
-                    'conversation_id' => $canonicalId,
-                    'content' => $m->content,
-                    'created_at' => optional($m->created_at)->toISOString(),
+        $conversations = [];
+        foreach ($paginator->items() as $row) {
+            $conversationId = (string) ($row->conversation_id ?? '');
+            if ($conversationId === '') continue;
 
-                    'sender' => $senderNormalized,
-                    'sender_id' => $m->sender_id,
-                    'sender_name' => $senderName,
-                    'sender_email' => $m->sender_user_email,
-                    'sender_role' => $m->sender_user_role,
-                    'sender_avatar_url' => $m->sender_user_avatar,
+            $msg = $messages->get((int) ($row->last_id ?? 0));
+            if (! $msg) continue;
 
-                    'recipient_id' => $m->recipient_id,
-                    'recipient_role' => $recipientRoleNormalized,
-                    'recipient_name' => $recipientName,
-                    'recipient_email' => $m->recipient_user_email,
-                    'recipient_user_role' => $m->recipient_user_role,
-                    'recipient_avatar_url' => $m->recipient_user_avatar,
+            $unreadCount = (int) ($row->unread_count ?? 0);
 
-                    'owner_user_id' => $m->user_id,
-                    'owner_name' => $m->owner_user_name,
-                    'owner_email' => $m->owner_user_email,
-                    'owner_role' => $m->owner_user_role,
-                    'owner_avatar_url' => $m->owner_user_avatar,
-
-                    'is_read' => (bool) $m->is_read,
-                    'counselor_is_read' => (bool) $m->counselor_is_read,
-                    'student_read_at' => optional($m->student_read_at)->toISOString(),
-                    'counselor_read_at' => optional($m->counselor_read_at)->toISOString(),
-                ],
+            $conversations[] = [
+                'conversation_id' => $conversationId,
+                'last_message' => $this->messageToDto($actor, $msg, $conversationId),
+                'unread_count' => $unreadCount,
+                'has_unread' => $unreadCount > 0,
             ];
-        })->values();
+        }
 
         return response()->json([
-            'message' => 'Fetched conversations.',
+            'message' => 'Fetched admin conversations.',
             'conversations' => $conversations,
             'pagination' => [
                 'current_page' => $paginator->currentPage(),
@@ -351,343 +450,271 @@ class MessageController extends Controller
     }
 
     /**
-     * ✅ FIX (405): POST /admin/messages
-     * Create/send a message as admin.
-     *
-     * ✅ Enforces canonical conversation_id and normalizes roles.
+     * ✅ Route compatibility:
+     * routes/web.php calls showConversation(), so keep it.
      */
-    public function store(Request $request): JsonResponse
+    public function showConversation(string $conversationId, Request $request): JsonResponse
     {
-        /** @var User|null $actor */
-        $actor = $request->user();
-
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
-        }
-
-        $validated = $request->validate([
-            'content' => ['required', 'string', 'max:5000'],
-            'recipient_id' => ['required'],
-            'recipient_role' => ['nullable', 'string', 'max:50'],
-            'conversation_id' => ['nullable', 'string', 'max:120'],
-        ]);
-
-        $recipientId = $validated['recipient_id'];
-        $recipient = User::query()->find($recipientId);
-
-        if (! $recipient) {
-            return response()->json(['message' => 'Recipient not found.'], 404);
-        }
-
-        $roleInput = $validated['recipient_role'] ?? $recipient->role ?? '';
-        $peerRole = $this->normalizeRole((string) $roleInput);
-
-        if ($peerRole === '' || $peerRole === 'system') {
-            // last-resort attempt from recipient record
-            $peerRole = $this->normalizeRole((string) ($recipient->role ?? ''));
-        }
-
-        if ($peerRole === '' || $peerRole === 'system') {
-            return response()->json(['message' => 'Invalid recipient role.'], 422);
-        }
-
-        $conversationId = $this->canonicalConversationIdForPeer($peerRole, $recipient->id);
-        if ($conversationId === '' || strlen($conversationId) > 120) {
-            return response()->json(['message' => 'Failed to generate conversation id.'], 422);
-        }
-
-        $m = new Message();
-        $m->conversation_id = $conversationId;
-
-        $m->content = (string) $validated['content'];
-
-        $m->sender = 'admin';
-        $m->sender_id = $actor->id;
-        $m->sender_name = (string) ($actor->name ?? 'Admin');
-
-        $m->recipient_id = $recipient->id;
-        $m->recipient_role = $peerRole;
-
-        // "owner" field used in your admin payloads—set to the peer so names hydrate nicely
-        $m->user_id = $recipient->id;
-
-        // mark unread for recipient
-        $m->is_read = false;
-        if ($peerRole === 'counselor') {
-            $m->counselor_is_read = false;
-        }
-
-        $m->save();
-
-        // hydrate relations for response consistency
-        $m->load([
-            'senderUser:id,name,email,role,avatar_url',
-            'recipientUser:id,name,email,role,avatar_url',
-            'user:id,name,email,role,avatar_url',
-        ]);
-
-        return response()->json([
-            'message' => 'Message sent.',
-            'messageRecord' => $this->messageToDto($m, $conversationId),
-        ], 201);
+        return $this->conversation($conversationId, $request);
     }
 
     /**
      * GET /admin/messages/conversations/{conversationId}
-     * Returns messages in a conversation, respecting per-user deletion timestamp.
      */
-    public function showConversation(Request $request, string $conversationId): JsonResponse
+    public function conversation(string $conversationId, Request $request): JsonResponse
     {
-        /** @var User|null $actor */
         $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
 
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
+        $conversationId = trim((string) $conversationId);
+        if ($conversationId === '') {
+            return response()->json(['message' => 'conversation_id is required.'], 422);
         }
 
-        $conversationId = trim($conversationId);
-        if ($conversationId === '' || strlen($conversationId) > 120) {
-            return response()->json(['message' => 'Invalid conversation id.'], 422);
-        }
+        $page = max(1, (int) $request->query('page', 1));
+        $perPage = (int) $request->query('per_page', 200);
+        $perPage = max(1, min(500, $perPage));
 
-        $perPageRaw = (int) $request->query('per_page', 50);
-        $perPage = $perPageRaw < 1 ? 50 : ($perPageRaw > 200 ? 200 : $perPageRaw);
+        $conversationExpr = $this->canonicalConversationExprForAdmin($actor, 'messages');
 
-        $deletion = MessageConversationDeletion::query()
-            ->where('user_id', $actor->id)
-            ->where('conversation_id', $conversationId)
-            ->first();
-
-        $expr = $this->canonicalConversationExpr('messages');
-
-        $query = Message::query()
-            ->whereRaw("{$expr} = ?", [$conversationId]);
-
-        // ✅ only allow viewing conversations involving THIS admin
-        $this->applyAdminParticipationFilter($query, $actor, 'messages');
-
-        $query->with([
+        $q = Message::query()
+            ->from('messages')
+            ->select('messages.*')
+            ->with([
                 'senderUser:id,name,email,role,avatar_url',
                 'recipientUser:id,name,email,role,avatar_url',
-                'user:id,name,email,role,avatar_url',
-            ])
-            ->orderBy('created_at', 'asc')
-            ->orderBy('id', 'asc');
+            ]);
 
-        if ($deletion && $deletion->deleted_at) {
-            $query->where('created_at', '>', $deletion->deleted_at);
+        // participation + deletion + conversation filter
+        $this->applyAdminParticipationFilter($q, $actor, 'messages');
+        $this->applyConversationDeletionFilter($q, $actor, $conversationExpr, 'messages');
+
+        $q->whereRaw("({$conversationExpr}) = ?", [$conversationId]);
+        $q->orderBy('messages.created_at', 'asc')->orderBy('messages.id', 'asc');
+
+        $p = $q->paginate($perPage, ['*'], 'page', $page);
+
+        $out = [];
+        foreach ($p->items() as $m) {
+            $out[] = $this->messageToDto($actor, $m, $conversationId);
         }
 
-        $paginator = $query->paginate($perPage);
-
-        $messages = collect($paginator->items())->map(function (Message $m) use ($conversationId) {
-            return $this->messageToDto($m, $conversationId);
-        })->values();
-
         return response()->json([
-            'message' => 'Fetched conversation.',
+            'message' => 'Fetched conversation messages.',
             'conversation_id' => $conversationId,
-            'deleted_at' => $deletion?->deleted_at ? $deletion->deleted_at->toISOString() : null,
-            'messages' => $messages,
+            'deleted_at' => null,
+            'messages' => $out,
             'pagination' => [
-                'current_page' => $paginator->currentPage(),
-                'per_page' => $paginator->perPage(),
-                'total' => $paginator->total(),
-                'last_page' => $paginator->lastPage(),
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'total' => $p->total(),
+                'last_page' => $p->lastPage(),
             ],
         ]);
     }
 
     /**
-     * ✅ NEW: POST /admin/messages/mark-as-read
-     * Mark specific message ids as read for the CURRENT admin (recipient).
-     *
-     * This is what makes "open thread" / "reply" persistently clear unread status.
+     * POST /admin/messages
      */
-    public function markAsRead(Request $request): JsonResponse
+    public function store(Request $request): JsonResponse
     {
-        /** @var User|null $actor */
         $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
 
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
+        $content = trim((string) $request->input('content', ''));
+        $recipientId = $request->input('recipient_id');
+        $recipientRoleRaw = (string) $request->input('recipient_role', '');
+        $recipientRole = $this->normalizeRole($recipientRoleRaw);
+
+        if ($content === '') {
+            return response()->json(['message' => 'content is required.'], 422);
+        }
+        if ($recipientId === null || trim((string) $recipientId) === '') {
+            return response()->json(['message' => 'recipient_id is required.'], 422);
+        }
+        if ($recipientRole === '') {
+            return response()->json(['message' => 'recipient_role is required.'], 422);
         }
 
-        $validated = $request->validate([
-            'message_ids' => ['required', 'array', 'min:1'],
-            'message_ids.*' => ['integer'],
+        $conversationId = $this->canonicalConversationIdForPeer($recipientRole, $recipientId);
+
+        $m = new Message();
+        $m->content = $content;
+
+        // Sender = admin
+        $m->sender = 'admin';
+        $m->sender_id = $actor->id;
+        $m->sender_name = $actor->name ?? 'Admin';
+
+        // Recipient
+        $m->recipient_id = $recipientId;
+        $m->recipient_role = $recipientRole;
+
+        $m->conversation_id = $conversationId;
+
+        if (in_array($recipientRole, ['student', 'guest'], true)) {
+            $m->user_id = $recipientId;
+        }
+
+        $m->save();
+
+        $m->load([
+            'senderUser:id,name,email,role,avatar_url',
+            'recipientUser:id,name,email,role,avatar_url',
         ]);
 
-        $ids = array_values(array_unique(array_map('intval', (array) ($validated['message_ids'] ?? []))));
-        $ids = array_values(array_filter($ids, fn ($v) => is_int($v) && $v > 0));
-
-        if (count($ids) === 0) {
-            return response()->json([
-                'message' => 'No message ids provided.',
-                'updated_count' => 0,
-            ], 200);
-        }
-
-        // Only mark messages where THIS admin is the recipient.
-        // We use recipient_id to be resilient even if recipient_role is missing/legacy.
-        $updated = Message::query()
-            ->whereIn('id', $ids)
-            ->whereNotNull('recipient_id')
-            ->whereRaw('CAST(recipient_id AS CHAR) = ?', [(string) $actor->id])
-            ->update([
-                'is_read' => true,
-            ]);
-
         return response()->json([
-            'message' => 'Marked messages as read.',
-            'updated_count' => (int) $updated,
-        ], 200);
+            'message' => 'Message sent.',
+            'messageRecord' => $this->messageToDto($actor, $m, $conversationId),
+        ], 201);
     }
 
     /**
-     * DELETE /admin/messages/conversations/{conversationId}
-     * Soft-delete (hide) a conversation for the current admin only.
-     *
-     * Optional: ?force=1 => hard delete conversation messages for ALL users (admin only).
+     * PATCH /admin/messages/{id}
      */
-    public function destroyConversation(Request $request, string $conversationId): JsonResponse
+    public function update($id, Request $request): JsonResponse
     {
-        /** @var User|null $actor */
         $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
 
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
+        $content = trim((string) $request->input('content', ''));
+        if ($content === '') {
+            return response()->json(['message' => 'content is required.'], 422);
         }
 
-        $conversationId = trim($conversationId);
-        if ($conversationId === '' || strlen($conversationId) > 120) {
-            return response()->json(['message' => 'Invalid conversation id.'], 422);
-        }
-
-        $force = (string) $request->query('force', '0');
-        $forceHardDelete = in_array(strtolower($force), ['1', 'true', 'yes'], true);
-
-        $expr = $this->canonicalConversationExpr('messages');
-
-        if ($forceHardDelete) {
-            Message::query()
-                ->whereRaw("{$expr} = ?", [$conversationId])
-                ->delete();
-
-            MessageConversationDeletion::query()
-                ->where('conversation_id', $conversationId)
-                ->delete();
-
-            return response()->json([
-                'message' => 'Conversation deleted permanently.',
-                'conversation_id' => $conversationId,
-            ]);
-        }
-
-        $now = Carbon::now();
-
-        MessageConversationDeletion::query()->updateOrCreate(
-            [
-                'user_id' => $actor->id,
-                'conversation_id' => $conversationId,
-            ],
-            [
-                'deleted_at' => $now,
-            ]
-        );
-
-        return response()->json([
-            'message' => 'Conversation deleted for this admin.',
-            'conversation_id' => $conversationId,
-            'deleted_at' => $now->toISOString(),
-        ]);
-    }
-
-    /**
-     * PATCH/PUT /admin/messages/{id}
-     * Admin edit message content.
-     */
-    public function update(Request $request, int $id): JsonResponse
-    {
-        /** @var User|null $actor */
-        $actor = $request->user();
-
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
-        }
-
-        $validated = $request->validate([
-            'content' => ['required', 'string', 'max:5000'],
-        ]);
-
-        $message = Message::query()->find($id);
-
-        if (! $message) {
+        $m = Message::query()->find($id);
+        if (! $m) {
             return response()->json(['message' => 'Message not found.'], 404);
         }
 
-        // ✅ Ensure this admin is part of the message
-        $senderRole = $this->normalizeRole($message->sender);
-        $recipientRole = $this->normalizeRole($message->recipient_role);
-
-        $isMine =
-            ($senderRole === 'admin' && (string) $message->sender_id === (string) $actor->id) ||
-            ($recipientRole === 'admin' && (string) $message->recipient_id === (string) $actor->id);
-
-        if (! $isMine) {
-            return $this->forbid();
+        if ((string) ($m->sender_id ?? '') !== (string) $actor->id || $this->normalizeRole($m->sender) !== 'admin') {
+            return response()->json(['message' => 'Forbidden.'], 403);
         }
 
-        $message->content = $validated['content'];
-        $message->save();
+        $m->content = $content;
+        $m->updated_at = Carbon::now();
+        $m->save();
 
         return response()->json([
             'message' => 'Message updated.',
             'data' => [
-                'id' => $message->id,
-                'conversation_id' => $message->conversation_id,
-                'content' => $message->content,
-                'updated_at' => optional($message->updated_at)->toISOString(),
+                'id' => $m->id,
+                'conversation_id' => $m->conversation_id,
+                'content' => $m->content,
+                'updated_at' => optional($m->updated_at)->toISOString(),
             ],
         ]);
     }
 
     /**
      * DELETE /admin/messages/{id}
-     * Admin hard-delete a single message.
      */
-    public function destroy(Request $request, int $id): JsonResponse
+    public function destroy($id, Request $request): JsonResponse
     {
-        /** @var User|null $actor */
         $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
 
-        if (! $this->isAdmin($actor)) {
-            return $this->forbid();
-        }
-
-        $message = Message::query()->find($id);
-
-        if (! $message) {
+        $m = Message::query()->find($id);
+        if (! $m) {
             return response()->json(['message' => 'Message not found.'], 404);
         }
 
-        // ✅ Ensure this admin is part of the message
-        $senderRole = $this->normalizeRole($message->sender);
-        $recipientRole = $this->normalizeRole($message->recipient_role);
-
-        $isMine =
-            ($senderRole === 'admin' && (string) $message->sender_id === (string) $actor->id) ||
-            ($recipientRole === 'admin' && (string) $message->recipient_id === (string) $actor->id);
-
-        if (! $isMine) {
-            return $this->forbid();
-        }
-
-        $message->delete();
+        $m->delete();
 
         return response()->json([
             'message' => 'Message deleted.',
             'id' => $id,
+        ]);
+    }
+
+    /**
+     * ✅ Route compatibility:
+     * routes/web.php calls destroyConversation(), so keep it.
+     */
+    public function destroyConversation(string $conversationId, Request $request): JsonResponse
+    {
+        return $this->deleteConversation($conversationId, $request);
+    }
+
+    /**
+     * DELETE /admin/messages/conversations/{conversationId}
+     */
+    public function deleteConversation(string $conversationId, Request $request): JsonResponse
+    {
+        $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
+
+        $conversationId = trim((string) $conversationId);
+        if ($conversationId === '') {
+            return response()->json(['message' => 'conversation_id is required.'], 422);
+        }
+
+        $now = Carbon::now();
+
+        $row = MessageConversationDeletion::query()->updateOrCreate(
+            [
+                'user_id' => (int) $actor->id,
+                'conversation_id' => $conversationId,
+            ],
+            [
+                'deleted_at' => $now,
+            ],
+        );
+
+        return response()->json([
+            'message' => 'Conversation deleted.',
+            'conversation_id' => $conversationId,
+            'deleted_at' => optional($row->deleted_at)->toISOString(),
+        ]);
+    }
+
+    /**
+     * POST /admin/messages/mark-as-read
+     *
+     * ✅ FIX: set read flag using boolean TRUE (DB-safe for boolean/tinyint).
+     */
+    public function markAsRead(Request $request): JsonResponse
+    {
+        $actor = $request->user();
+        if (! $this->isAdmin($actor)) return $this->forbid();
+
+        $ids = $request->input('message_ids', []);
+        if (! is_array($ids) || count($ids) === 0) {
+            return response()->json(['message' => 'message_ids is required.'], 422);
+        }
+
+        $clean = [];
+        foreach ($ids as $v) {
+            $s = trim((string) $v);
+            if ($s === '' || ! ctype_digit($s)) continue;
+            $clean[] = (int) $s;
+        }
+        $clean = array_values(array_unique($clean));
+
+        if (count($clean) === 0) {
+            return response()->json(['message' => 'message_ids is required.'], 422);
+        }
+
+        $readCol = $this->adminReadColumnName();
+        $recipientRoleSql = $this->roleSql('recipient_role');
+
+        $updated = Message::query()
+            ->whereIn('id', $clean)
+            ->where(function ($q) use ($actor, $recipientRoleSql) {
+                $q->where('recipient_id', '=', $actor->id)
+                  ->orWhere(function ($q2) use ($recipientRoleSql) {
+                      $q2->whereNull('recipient_id')
+                         ->whereRaw("({$recipientRoleSql}) = 'admin'");
+                  });
+            })
+            ->update([
+                $readCol => true, // ✅ important
+                'updated_at' => Carbon::now(),
+            ]);
+
+        return response()->json([
+            'message' => 'Marked messages as read.',
+            'updated_count' => (int) $updated,
         ]);
     }
 }

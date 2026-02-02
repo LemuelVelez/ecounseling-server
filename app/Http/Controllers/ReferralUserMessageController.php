@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Message;
 use App\Models\User;
 use App\Models\MessageConversationDeletion;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -64,23 +65,71 @@ class ReferralUserMessageController extends Controller
     }
 
     /**
+     * ✅ Referral-user sender variants seen in older data.
+     */
+    private function isReferralSenderValue(?string $sender): bool
+    {
+        $s = strtolower(trim((string) $sender));
+        if ($s === '') return false;
+
+        $norm = str_replace(['-', ' '], ['_', '_'], $s);
+
+        return $norm === 'referral_user'
+            || str_contains($norm, 'referral_user')
+            || str_contains($s, 'dean')
+            || str_contains($s, 'registrar')
+            || str_contains($s, 'program chair')
+            || str_contains($norm, 'program_chair')
+            || str_contains($s, 'programchair')
+            || str_contains($s, 'chair')
+            || str_contains($s, 'chairperson');
+    }
+
+    /**
+     * ✅ Normalize sender role so frontend can reliably filter/group:
+     * - dean/registrar/program_chair/... => referral_user
+     * - guidance/counsellor/... => counselor
+     * - admin variants => admin
+     */
+    private function normalizeSenderRole(?string $sender): string
+    {
+        $s = strtolower(trim((string) $sender));
+        if ($s === '') return '';
+
+        if ($this->isAdminSenderValue($s)) return 'admin';
+        if ($this->isCounselorSenderValue($s)) return 'counselor';
+        if ($this->isReferralSenderValue($s)) return 'referral_user';
+
+        return $s;
+    }
+
+    /**
      * ✅ Referral-user role variants seen in older data.
+     * IMPORTANT: normalize to "referral_user" so the frontend's isVisibleForMe() won't drop them.
      */
     private function normalizeRecipientRole(?string $role): string
     {
         $r = strtolower(trim((string) $role));
         if ($r === '') return '';
 
-        if (in_array($r, [
-            'referral_user',
-            'referral-user',
-            'referral user',
-            'dean',
-            'registrar',
-            'program_chair',
-            'program chair',
-            'programchair',
-        ], true)) {
+        $norm = str_replace(['-', ' '], ['_', '_'], $r);
+
+        if (
+            $norm === 'referral_user' ||
+            str_contains($norm, 'referral_user') ||
+            in_array($r, [
+                'referral_user',
+                'referral-user',
+                'referral user',
+                'dean',
+                'registrar',
+                'program_chair',
+                'program chair',
+                'programchair',
+                'chair',
+                'chairperson',
+            ], true)
+        ) {
             return 'referral_user';
         }
 
@@ -129,29 +178,34 @@ class ReferralUserMessageController extends Controller
             }
         }
 
-        $sender = strtolower(trim((string) ($m->sender ?? '')));
+        $senderKind = $this->normalizeSenderRole($m->sender ?? '');
 
         $senderId = (int) ($m->sender_id ?? 0);
         $recipientId = (int) ($m->recipient_id ?? 0);
+        $ownerId = (int) ($m->user_id ?? 0);
 
-        $recipientRole = strtolower(trim((string) ($m->recipient_role ?? '')));
         $recipientRoleNorm = $this->normalizeRecipientRole($m->recipient_role ?? '');
 
         // referral_user -> counselor/admin
-        if ($sender === 'referral_user' && in_array($recipientRole, ['counselor', 'admin'], true) && $senderId > 0 && $recipientId > 0) {
-            return $this->conversationIdFor($senderId, $recipientRole, $recipientId);
+        if ($senderKind === 'referral_user' && in_array($recipientRoleNorm, ['counselor', 'admin'], true)) {
+            $refId = $senderId > 0 ? $senderId : ($ownerId > 0 ? $ownerId : 0);
+            if ($refId > 0 && $recipientId > 0) {
+                return $this->conversationIdFor($refId, $recipientRoleNorm, $recipientId);
+            }
         }
 
-        // counselor/admin -> referral_user (and legacy counselor sender variants)
-        if (($this->isCounselorSenderValue($sender) || $this->isAdminSenderValue($sender)) && $recipientRoleNorm === 'referral_user' && $senderId > 0 && $recipientId > 0) {
-            // recipient_id is referral user, sender_id is peer
-            $peerRole = $this->isAdminSenderValue($sender) ? 'admin' : 'counselor';
-            return $this->conversationIdFor($recipientId, $peerRole, $senderId);
+        // counselor/admin -> referral_user
+        if (in_array($senderKind, ['counselor', 'admin'], true) && $recipientRoleNorm === 'referral_user') {
+            $refId = $recipientId > 0 ? $recipientId : ($ownerId > 0 ? $ownerId : 0);
+            $peerId = $senderId > 0 ? $senderId : 0;
+
+            if ($refId > 0 && $peerId > 0) {
+                return $this->conversationIdFor($refId, $senderKind, $peerId);
+            }
         }
 
         // legacy-safe fallback (keeps it unique to this referral user)
-        $owner = (int) ($m->user_id ?? 0);
-        if ($owner > 0) return "referral_user-{$owner}";
+        if ($ownerId > 0) return "referral_user-{$ownerId}";
 
         return 'referral_user-office';
     }
@@ -162,6 +216,61 @@ class ReferralUserMessageController extends Controller
         if ($name && trim($name) !== '') return $name;
         if ($fallback && trim($fallback) !== '') return $fallback;
         return null;
+    }
+
+    private function applyRecipientIsReferralUser(Builder $q): Builder
+    {
+        // robust to older recipient_role variants
+        return $q->where(function ($rr) {
+            $rr->where('recipient_role', 'referral_user')
+               ->orWhere('recipient_role', 'referral-user')
+               ->orWhere('recipient_role', 'referral user')
+               ->orWhere('recipient_role', 'dean')
+               ->orWhere('recipient_role', 'registrar')
+               ->orWhere('recipient_role', 'program_chair')
+               ->orWhere('recipient_role', 'program chair')
+               ->orWhere('recipient_role', 'programchair')
+               ->orWhere('recipient_role', 'chair')
+               ->orWhere('recipient_role', 'chairperson')
+               ->orWhereRaw("LOWER(REPLACE(REPLACE(recipient_role,'-','_'),' ','_')) LIKE ?", ['%referral_user%']);
+        });
+    }
+
+    private function applySenderIsReferralUser(Builder $q): Builder
+    {
+        // robust to older sender values used by referral-user roles (dean/registrar/etc)
+        return $q->where(function ($s) {
+            $s->where('sender', 'referral_user')
+              ->orWhere('sender', 'referral-user')
+              ->orWhere('sender', 'referral user')
+              ->orWhere('sender', 'dean')
+              ->orWhere('sender', 'registrar')
+              ->orWhere('sender', 'program_chair')
+              ->orWhere('sender', 'program chair')
+              ->orWhere('sender', 'programchair')
+              ->orWhere('sender', 'chair')
+              ->orWhere('sender', 'chairperson')
+              ->orWhereRaw("LOWER(REPLACE(REPLACE(sender,'-','_'),' ','_')) LIKE ?", ['%referral_user%'])
+              ->orWhereRaw('LOWER(sender) LIKE ?', ['%dean%'])
+              ->orWhereRaw('LOWER(sender) LIKE ?', ['%registrar%'])
+              ->orWhereRaw('LOWER(sender) LIKE ?', ['%program chair%'])
+              ->orWhereRaw("LOWER(REPLACE(REPLACE(sender,'-','_'),' ','_')) LIKE ?", ['%program_chair%'])
+              ->orWhereRaw('LOWER(sender) LIKE ?', ['%programchair%'])
+              ->orWhereRaw('LOWER(sender) LIKE ?', ['%chair%']);
+        });
+    }
+
+    private function applySenderIsCounselorOrAdmin(Builder $q): Builder
+    {
+        // counselor OR admin senders (and legacy variants)
+        return $q->where(function ($q3) {
+            $q3->where('sender', 'counselor')
+               ->orWhere('sender', 'admin')
+               ->orWhereRaw('LOWER(sender) LIKE ?', ['%counselor%'])
+               ->orWhereRaw('LOWER(sender) LIKE ?', ['%counsellor%'])
+               ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%'])
+               ->orWhereRaw('LOWER(sender) LIKE ?', ['%admin%']);
+        });
     }
 
     private function toApiDto(Message $m): array
@@ -180,10 +289,40 @@ class ReferralUserMessageController extends Controller
         $dto = $m->toArray();
 
         /**
-         * ✅ CRITICAL FIX:
-         * Always return a stable, canonical conversation_id so the frontend never splits threads.
+         * ✅ CRITICAL:
+         * Always return stable canonical values that the frontend expects:
+         * - conversation_id: canonical thread id
+         * - recipient_role: normalize dean/registrar/... => referral_user
+         * - sender: normalize dean/registrar/... => referral_user; guidance/... => counselor; admin variants => admin
          */
         $dto['conversation_id'] = $this->conversationKey($m);
+
+        $senderNorm = $this->normalizeSenderRole($m->sender ?? null);
+        if ($senderNorm !== '') {
+            $dto['sender'] = $senderNorm;
+        }
+
+        $recNorm = $this->normalizeRecipientRole($m->recipient_role ?? null);
+        if ($recNorm !== '') {
+            $dto['recipient_role'] = $recNorm;
+        }
+
+        // ✅ Legacy safety: if old rows missed sender_id/recipient_id, provide safe fallbacks
+        $ownerId = (int) ($m->user_id ?? 0);
+
+        if (($dto['sender'] ?? null) === 'referral_user') {
+            $sid = (int) ($m->sender_id ?? 0);
+            if ($sid <= 0 && $ownerId > 0) {
+                $dto['sender_id'] = $ownerId;
+            }
+        }
+
+        if (($dto['recipient_role'] ?? null) === 'referral_user') {
+            $rid = (int) ($m->recipient_id ?? 0);
+            if ($rid <= 0 && $ownerId > 0) {
+                $dto['recipient_id'] = $ownerId;
+            }
+        }
 
         $dto['sender_name'] = $senderName;
 
@@ -199,6 +338,31 @@ class ReferralUserMessageController extends Controller
             'name' => $recipientUser->name,
             'avatar_url' => $recipientUser->avatar_url,
         ] : null;
+
+        // Optional convenience: expose recipient_name if missing (helps UI titles)
+        if ((!isset($dto['recipient_name']) || trim((string) ($dto['recipient_name'] ?? '')) === '') && $recipientUser) {
+            $dto['recipient_name'] = $recipientUser->name;
+        }
+
+        /**
+         * ✅ EXTRA (safe) metadata:
+         * Helps any client reliably know which peer this thread is with.
+         * (Does not break existing clients; just additional fields.)
+         */
+        $cid = (string) ($dto['conversation_id'] ?? '');
+        if ($this->isCanonicalConversationId($cid)) {
+            if (preg_match('/^referral_user-(\d+)-(counselor|admin)-(\d+)$/', $cid, $mm)) {
+                $dto['peer_role'] = $mm[2];
+                $dto['peer_id'] = (int) $mm[3];
+
+                // peer_name best-effort
+                if (($dto['sender'] ?? null) === 'referral_user') {
+                    $dto['peer_name'] = $this->resolveDisplayName($recipientUser, (string) ($dto['recipient_name'] ?? ''));
+                } else {
+                    $dto['peer_name'] = $this->resolveDisplayName($senderUser, (string) ($dto['sender_name'] ?? ''));
+                }
+            }
+        }
 
         return $dto;
     }
@@ -245,36 +409,36 @@ class ReferralUserMessageController extends Controller
                 'senderUser:id,name,avatar_url',
                 'recipientUser:id,name,avatar_url',
             ])
-            ->where(function ($q) use ($user) {
+            ->where(function (Builder $q) use ($user) {
                 // (A) Sent by this referral user -> counselor/admin only
-                $q->where(function ($q2) use ($user) {
-                    $q2->where('sender', 'referral_user')
-                        ->where('sender_id', (int) $user->id)
-                        ->whereIn('recipient_role', ['counselor', 'admin']);
-                })
-                // (B) Sent by counselor/admin -> this referral user only
-                ->orWhere(function ($q2) use ($user) {
-                    // be robust to older recipient_role variants
-                    $q2->where(function ($rr) {
-                        $rr->where('recipient_role', 'referral_user')
-                           ->orWhere('recipient_role', 'referral-user')
-                           ->orWhere('recipient_role', 'referral user')
-                           ->orWhere('recipient_role', 'dean')
-                           ->orWhere('recipient_role', 'registrar')
-                           ->orWhere('recipient_role', 'program_chair')
-                           ->orWhere('recipient_role', 'program chair')
-                           ->orWhere('recipient_role', 'programchair');
-                    })
-                    ->where('recipient_id', (int) $user->id)
-                    ->where(function ($q3) {
-                        // counselor OR admin senders (and legacy variants)
-                        $q3->where('sender', 'counselor')
-                           ->orWhere('sender', 'admin')
-                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%counselor%'])
-                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%counsellor%'])
-                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%guidance%'])
-                           ->orWhereRaw('LOWER(sender) LIKE ?', ['%admin%']);
+                $q->where(function (Builder $q2) use ($user) {
+                    $this->applySenderIsReferralUser($q2);
+
+                    // Prefer sender_id, but legacy rows may rely on owner user_id
+                    $q2->where(function (Builder $id) use ($user) {
+                        $id->where('sender_id', (int) $user->id)
+                           ->orWhere(function (Builder $legacy) use ($user) {
+                               $legacy->whereNull('sender_id')
+                                      ->where('user_id', (int) $user->id);
+                           });
                     });
+
+                    $q2->whereIn('recipient_role', ['counselor', 'admin']);
+                })
+
+                // (B) Sent by counselor/admin -> this referral user only
+                ->orWhere(function (Builder $q2) use ($user) {
+                    $this->applyRecipientIsReferralUser($q2);
+
+                    $q2->where(function (Builder $id) use ($user) {
+                        $id->where('recipient_id', (int) $user->id)
+                           ->orWhere(function (Builder $legacy) use ($user) {
+                               $legacy->whereNull('recipient_id')
+                                      ->where('user_id', (int) $user->id);
+                           });
+                    });
+
+                    $this->applySenderIsCounselorOrAdmin($q2);
                 });
             })
             ->orderBy('created_at', 'asc')
@@ -403,23 +567,16 @@ class ReferralUserMessageController extends Controller
             'message_ids.*' => ['integer'],
         ]);
 
-        $q = Message::query()
-            ->where(function ($rr) {
-                $rr->where('recipient_role', 'referral_user')
-                   ->orWhere('recipient_role', 'referral-user')
-                   ->orWhere('recipient_role', 'referral user')
-                   ->orWhere('recipient_role', 'dean')
-                   ->orWhere('recipient_role', 'registrar')
-                   ->orWhere('recipient_role', 'program_chair')
-                   ->orWhere('recipient_role', 'program chair')
-                   ->orWhere('recipient_role', 'programchair');
-            })
-            ->where('recipient_id', (int) $user->id)
-            ->where(function ($w) {
-                $w->where('is_read', false)
-                  ->orWhere('is_read', 0)
-                  ->orWhereNull('is_read');
-            });
+        $q = Message::query();
+
+        $this->applyRecipientIsReferralUser($q);
+
+        $q->where('recipient_id', (int) $user->id)
+          ->where(function ($w) {
+              $w->where('is_read', false)
+                ->orWhere('is_read', 0)
+                ->orWhereNull('is_read');
+          });
 
         $ids = $data['message_ids'] ?? null;
         if (is_array($ids) && count($ids) > 0) {
@@ -456,7 +613,8 @@ class ReferralUserMessageController extends Controller
         if (! $m) return response()->json(['message' => 'Message not found.'], 404);
 
         // Only edit own referral_user-sent message
-        if (strtolower((string) $m->sender) !== 'referral_user' || (int) $m->sender_id !== (int) $user->id) {
+        $senderNorm = $this->normalizeSenderRole($m->sender ?? null);
+        if ($senderNorm !== 'referral_user' || (int) ($m->sender_id ?? 0) !== (int) $user->id) {
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
@@ -493,7 +651,8 @@ class ReferralUserMessageController extends Controller
         $m = Message::query()->find($id);
         if (! $m) return response()->json(['message' => 'Message not found.'], 404);
 
-        if (strtolower((string) $m->sender) !== 'referral_user' || (int) $m->sender_id !== (int) $user->id) {
+        $senderNorm = $this->normalizeSenderRole($m->sender ?? null);
+        if ($senderNorm !== 'referral_user' || (int) ($m->sender_id ?? 0) !== (int) $user->id) {
             return response()->json(['message' => 'Forbidden.'], 403);
         }
 
