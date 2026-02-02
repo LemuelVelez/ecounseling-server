@@ -319,14 +319,6 @@ class MessageController extends Controller
         ];
     }
 
-    /**
-     * GET /admin/messages
-     *
-     * ✅ FIX:
-     * - avoids window functions (ROW_NUMBER / SUM OVER)
-     * - uses GROUP BY conversation + MAX(last_id) + SUM(unread_case)
-     * - unread check is DB-safe (boolean/int/null)
-     */
     public function index(Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -349,7 +341,6 @@ class MessageController extends Controller
 
         $uid = (int) $actor->id;
 
-        // unread case: addressed to this admin OR broadcast admin AND not read
         $unreadCaseSql = "
             CASE
                 WHEN (
@@ -367,16 +358,13 @@ class MessageController extends Controller
             ->selectRaw("MAX(messages.created_at) as last_created_at")
             ->selectRaw("SUM({$unreadCaseSql}) as unread_count");
 
-        // exclude soft-deleted messages if the column exists (DB::table doesn't auto-apply SoftDeletes)
         if ($this->messagesHasSoftDeletes()) {
             $q->whereNull('messages.deleted_at');
         }
 
-        // participation + deletions
         $this->applyAdminParticipationFilter($q, $actor, 'messages');
         $this->applyConversationDeletionFilter($q, $actor, $conversationExpr, 'messages');
 
-        // Optional search (best-effort)
         if ($search !== '') {
             $q->leftJoin('users as su', 'messages.sender_id', '=', 'su.id');
             $q->leftJoin('users as ru', 'messages.recipient_id', '=', 'ru.id');
@@ -449,18 +437,11 @@ class MessageController extends Controller
         ]);
     }
 
-    /**
-     * ✅ Route compatibility:
-     * routes/web.php calls showConversation(), so keep it.
-     */
     public function showConversation(string $conversationId, Request $request): JsonResponse
     {
         return $this->conversation($conversationId, $request);
     }
 
-    /**
-     * GET /admin/messages/conversations/{conversationId}
-     */
     public function conversation(string $conversationId, Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -485,7 +466,6 @@ class MessageController extends Controller
                 'recipientUser:id,name,email,role,avatar_url',
             ]);
 
-        // participation + deletion + conversation filter
         $this->applyAdminParticipationFilter($q, $actor, 'messages');
         $this->applyConversationDeletionFilter($q, $actor, $conversationExpr, 'messages');
 
@@ -552,8 +532,22 @@ class MessageController extends Controller
 
         $m->conversation_id = $conversationId;
 
-        if (in_array($recipientRole, ['student', 'guest'], true)) {
-            $m->user_id = $recipientId;
+        /**
+         * ✅ CRITICAL FIX for PostgreSQL NOT NULL constraint:
+         * messages.user_id is NOT NULL in your DB, but previously it was only set for student/guest.
+         * When admin sends to referral_user/counselor/etc, user_id stayed NULL → 23502.
+         *
+         * We set user_id for ALL outgoing admin messages.
+         * The safest meaning here is "the peer user in this conversation" = recipient.
+         */
+        try {
+            if (Schema::hasColumn('messages', 'user_id')) {
+                // keep numeric ids numeric when possible
+                $m->user_id = ctype_digit((string) $recipientId) ? (int) $recipientId : $recipientId;
+            }
+        } catch (\Throwable $e) {
+            // ignore schema check failures
+            $m->user_id = ctype_digit((string) $recipientId) ? (int) $recipientId : $recipientId;
         }
 
         $m->save();
@@ -569,9 +563,6 @@ class MessageController extends Controller
         ], 201);
     }
 
-    /**
-     * PATCH /admin/messages/{id}
-     */
     public function update($id, Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -606,9 +597,6 @@ class MessageController extends Controller
         ]);
     }
 
-    /**
-     * DELETE /admin/messages/{id}
-     */
     public function destroy($id, Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -627,18 +615,11 @@ class MessageController extends Controller
         ]);
     }
 
-    /**
-     * ✅ Route compatibility:
-     * routes/web.php calls destroyConversation(), so keep it.
-     */
     public function destroyConversation(string $conversationId, Request $request): JsonResponse
     {
         return $this->deleteConversation($conversationId, $request);
     }
 
-    /**
-     * DELETE /admin/messages/conversations/{conversationId}
-     */
     public function deleteConversation(string $conversationId, Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -668,11 +649,6 @@ class MessageController extends Controller
         ]);
     }
 
-    /**
-     * POST /admin/messages/mark-as-read
-     *
-     * ✅ FIX: set read flag using boolean TRUE (DB-safe for boolean/tinyint).
-     */
     public function markAsRead(Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -708,7 +684,7 @@ class MessageController extends Controller
                   });
             })
             ->update([
-                $readCol => true, // ✅ important
+                $readCol => true,
                 'updated_at' => Carbon::now(),
             ]);
 

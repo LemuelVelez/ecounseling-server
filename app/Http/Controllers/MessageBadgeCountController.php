@@ -187,32 +187,44 @@ class MessageBadgeCountController extends Controller
         ]);
     }
 
+    /**
+     * ✅ UPDATED COUNSELOR COUNTER:
+     * Count conversations where there exists ANY unread message addressed to this counselor.
+     * (This prevents unread masking if another role (e.g., admin) posts later in the same conversation_id.)
+     */
     private static function unreadConversationCountForCounselor(User $user): int
     {
         $userId = (int) $user->id;
 
         $effectiveConversationIdSql = "COALESCE(NULLIF(messages.conversation_id,''), CONCAT('student-', messages.user_id))";
 
+        $recipientRoleSql = self::normalizeRoleSql('messages.recipient_role');
+        $isUnreadCounselor = self::unreadFlagPredicateSql('messages.counselor_is_read');
+
         $base = DB::table('messages')
             ->leftJoin('message_conversation_deletions as mcd', function ($join) use ($userId, $effectiveConversationIdSql) {
                 $join->on(DB::raw($effectiveConversationIdSql), '=', 'mcd.conversation_id')
                     ->where('mcd.user_id', '=', $userId);
             })
-            ->where(function ($q) use ($userId) {
-                $q->where(function ($q2) use ($userId) {
-                    $q2->where('messages.recipient_role', 'counselor')
+            ->where(function ($q) use ($userId, $recipientRoleSql) {
+                // Messages addressed to this counselor (inbox or direct)
+                $q->where(function ($q2) use ($userId, $recipientRoleSql) {
+                    $q2->whereRaw("({$recipientRoleSql}) = 'counselor'")
                         ->where(function ($q3) use ($userId) {
                             $q3->whereNull('messages.recipient_id')
                                 ->orWhere('messages.recipient_id', '=', $userId);
                         });
                 })
+                // Include counselor outgoing so deletion joins still behave consistently
+                ->orWhere(function ($q2) use ($userId) {
+                    $senderRoleSql = self::normalizeRoleSql('messages.sender');
+                    $q2->whereRaw("({$senderRoleSql}) = 'counselor'")
+                        ->where('messages.sender_id', '=', $userId);
+                })
+                // Legacy student conversation ids
                 ->orWhere(function ($q2) {
                     $q2->whereNotNull('messages.conversation_id')
                         ->where('messages.conversation_id', 'like', 'student-%');
-                })
-                ->orWhere(function ($q2) use ($userId) {
-                    $q2->where('messages.sender', 'counselor')
-                        ->where('messages.sender_id', '=', $userId);
                 });
             })
             ->where(function ($q) {
@@ -220,32 +232,25 @@ class MessageBadgeCountController extends Controller
                     ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
             });
 
-        $ranked = $base->select([
-            'messages.id',
-            DB::raw($effectiveConversationIdSql . ' as conversation_id'),
-            'messages.sender',
-            'messages.recipient_role',
-            'messages.recipient_id',
-            'messages.is_read',
-            'messages.counselor_is_read',
-            'messages.created_at',
-            DB::raw("ROW_NUMBER() OVER (PARTITION BY {$effectiveConversationIdSql} ORDER BY messages.created_at DESC, messages.id DESC) as rn"),
-        ]);
+        $unreadCase = DB::raw("
+            CASE
+                WHEN (
+                    ({$recipientRoleSql}) = 'counselor'
+                    AND (messages.recipient_id IS NULL OR messages.recipient_id = {$userId})
+                    AND ({$isUnreadCounselor})
+                ) THEN 1 ELSE 0 END
+        ");
 
-        $latestPerConversation = DB::query()
-            ->fromSub($ranked, 't')
-            ->where('t.rn', '=', 1);
-
-        $isUnreadCounselor = self::unreadFlagPredicateSql('t.counselor_is_read');
-        $isUnreadLegacy = self::unreadFlagPredicateSql('t.is_read');
-
-        $count = $latestPerConversation
-            ->where('t.recipient_role', '=', 'counselor')
-            ->where(function ($q) use ($userId) {
-                $q->whereNull('t.recipient_id')
-                    ->orWhere('t.recipient_id', '=', $userId);
-            })
-            ->whereRaw("({$isUnreadCounselor}) AND ({$isUnreadLegacy})")
+        $count = DB::query()
+            ->fromSub(
+                $base->select([
+                    DB::raw($effectiveConversationIdSql . ' as conversation_id'),
+                    $unreadCase . " as unread_flag",
+                ]),
+                't'
+            )
+            ->groupBy('t.conversation_id')
+            ->havingRaw('SUM(t.unread_flag) > 0')
             ->count();
 
         return (int) $count;
@@ -356,6 +361,11 @@ class MessageBadgeCountController extends Controller
         return (int) $count;
     }
 
+    /**
+     * ✅ UPDATED STUDENT/GUEST COUNTER:
+     * Count conversations where there exists ANY unread message sent to the student/guest
+     * from counselor/admin/system (instead of relying on "latest message").
+     */
     private static function unreadConversationCountForStudentOrGuest(User $user): int
     {
         $userId = (int) $user->id;
@@ -373,24 +383,27 @@ class MessageBadgeCountController extends Controller
                     ->orWhereColumn('messages.created_at', '>', 'mcd.deleted_at');
             });
 
-        $ranked = $base->select([
-            'messages.id',
-            DB::raw($effectiveConversationIdSql . ' as conversation_id'),
-            'messages.sender',
-            'messages.is_read',
-            'messages.created_at',
-            DB::raw("ROW_NUMBER() OVER (PARTITION BY {$effectiveConversationIdSql} ORDER BY messages.created_at DESC, messages.id DESC) as rn"),
-        ]);
+        $senderRoleSql = self::normalizeRoleSql('messages.sender');
+        $isUnread = self::unreadFlagPredicateSql('messages.is_read');
 
-        $latestPerConversation = DB::query()
-            ->fromSub($ranked, 't')
-            ->where('t.rn', '=', 1);
+        $unreadCase = DB::raw("
+            CASE
+                WHEN (
+                    ({$senderRoleSql}) IN ('counselor','admin','system')
+                    AND ({$isUnread})
+                ) THEN 1 ELSE 0 END
+        ");
 
-        $isUnread = self::unreadFlagPredicateSql('t.is_read');
-
-        $count = $latestPerConversation
-            ->whereIn('t.sender', ['counselor', 'system'])
-            ->whereRaw("({$isUnread})")
+        $count = DB::query()
+            ->fromSub(
+                $base->select([
+                    DB::raw($effectiveConversationIdSql . ' as conversation_id'),
+                    $unreadCase . " as unread_flag",
+                ]),
+                't'
+            )
+            ->groupBy('t.conversation_id')
+            ->havingRaw('SUM(t.unread_flag) > 0')
             ->count();
 
         return (int) $count;

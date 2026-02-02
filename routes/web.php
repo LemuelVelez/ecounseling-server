@@ -390,6 +390,9 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
 
     $isAdmin = str_contains($actorRole, 'admin');
 
+    $isStudent = str_contains($actorRole, 'student');
+    $isGuest = str_contains($actorRole, 'guest');
+
     // ✅ referral-user (Dean/Registrar/Program Chair/referral_user)
     $isReferralUser =
         $actorRole === 'referral_user' ||
@@ -408,8 +411,9 @@ function directoryCanListUsers(?User $actor, string $targetRole): bool
     // ✅ Anyone authenticated may list counselors (needed by StudentMessages.tsx)
     if ($target === 'counselor') return true;
 
-    // ✅ FIX: allow referral-user to search admins (needed for referral-user messaging UI)
-    if ($target === 'admin') return $isCounselor || $isAdmin || $isReferralUser;
+    // ✅ UPDATED: allow STUDENTS to list admins so they can message admins.
+    // (Guests remain disallowed by default; change if you want guests to message admins too.)
+    if ($target === 'admin') return $isCounselor || $isAdmin || $isReferralUser || ($isStudent && ! $isGuest);
 
     // ✅ referral_user list is for counselor/admin only
     if ($target === 'referral_user') return $isCounselor || $isAdmin;

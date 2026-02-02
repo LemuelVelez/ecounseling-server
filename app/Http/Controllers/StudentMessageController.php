@@ -9,6 +9,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class StudentMessageController extends Controller
 {
@@ -17,7 +18,15 @@ class StudentMessageController extends Controller
         if (! $user) return false;
 
         $role = strtolower((string) ($user->role ?? ''));
-        return str_contains($role, 'counselor') || str_contains($role, 'counsellor');
+        return str_contains($role, 'counselor') || str_contains($role, 'counsellor') || str_contains($role, 'guidance');
+    }
+
+    private function isAdmin(?User $user): bool
+    {
+        if (! $user) return false;
+
+        $role = strtolower((string) ($user->role ?? ''));
+        return str_contains($role, 'admin');
     }
 
     /**
@@ -32,7 +41,7 @@ class StudentMessageController extends Controller
         if ($r === '') return '';
 
         // Common contains-based normalization (covers "guidance_counselor", etc.)
-        if (str_contains($r, 'counselor') || str_contains($r, 'counsellor')) return 'counselor';
+        if (str_contains($r, 'counselor') || str_contains($r, 'counsellor') || str_contains($r, 'guidance')) return 'counselor';
         if (str_contains($r, 'admin')) return 'admin';
         if (str_contains($r, 'student')) return 'student';
         if (str_contains($r, 'guest')) return 'guest';
@@ -80,11 +89,19 @@ class StudentMessageController extends Controller
             return $canonicalStudentKey;
         }
 
-        // Legacy keys produced by Student UI
+        // Legacy keys produced by Student UI (counselor)
         if ($lk === 'counselor-office') {
             return $canonicalStudentKey;
         }
         if (str_starts_with($lk, 'counselor-')) {
+            return $canonicalStudentKey;
+        }
+
+        // Legacy keys produced by Student UI (admin)
+        if ($lk === 'admin-office' || $lk === 'administrator-office') {
+            return $canonicalStudentKey;
+        }
+        if (str_starts_with($lk, 'admin-') || str_starts_with($lk, 'administrator-')) {
             return $canonicalStudentKey;
         }
 
@@ -97,6 +114,15 @@ class StudentMessageController extends Controller
         return $k;
     }
 
+    private function hasMessagesColumn(string $col): bool
+    {
+        try {
+            return Schema::hasColumn('messages', $col);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
     /**
      * GET /student/messages
      *
@@ -107,7 +133,7 @@ class StudentMessageController extends Controller
      *   to prevent duplicate threads on the frontend.
      * - Normalize sender/recipient_role values to stable canonical roles.
      * - Respect conversation deletions: if deleted at time T, only show messages created AFTER T.
-     *   (Also respects legacy deletion keys like "counselor-office", "counselor-{id}".)
+     *   (Also respects legacy deletion keys like "counselor-office", "counselor-{id}", "admin-office", "admin-{id}".)
      */
     public function index(Request $request): JsonResponse
     {
@@ -184,9 +210,10 @@ class StudentMessageController extends Controller
      *
      * Create a new message authored by the current student OR guest.
      *
-     * ✅ FIXED:
+     * ✅ UPDATED:
+     * - Students can message counselors OR admins only.
+     * - Guests can message counselors only (keeps current behavior unless you want guests to message admins too).
      * - Enforce canonical conversation_id ("student-{id}") ALWAYS.
-     * - Normalize/validate recipient_role variations; students can only message counselors here.
      */
     public function store(Request $request): JsonResponse
     {
@@ -223,20 +250,43 @@ class StudentMessageController extends Controller
         $userRole = $this->normalizeRole((string) ($user->role ?? 'student'));
         $senderRole = ($userRole === 'guest') ? 'guest' : 'student';
 
-        $recipientRoleInput = $this->normalizeRole($data['recipient_role'] ?? 'counselor');
-        if ($recipientRoleInput !== '' && $recipientRoleInput !== 'counselor') {
-            return response()->json([
-                'message' => 'Invalid recipient_role. Students can only message counselors.',
-            ], 422);
+        // Default recipient is counselor (existing behavior)
+        $recipientRoleInput = $this->normalizeRole($data['recipient_role'] ?? '');
+        if ($recipientRoleInput === '') $recipientRoleInput = 'counselor';
+
+        // ✅ Enforce allowed recipients:
+        // - student: counselor OR admin
+        // - guest: counselor only (change if you want guests to message admins too)
+        if ($senderRole === 'guest') {
+            if ($recipientRoleInput !== 'counselor') {
+                return response()->json([
+                    'message' => 'Invalid recipient_role. Guests can only message counselors.',
+                ], 422);
+            }
+        } else {
+            if (! in_array($recipientRoleInput, ['counselor', 'admin'], true)) {
+                return response()->json([
+                    'message' => 'Invalid recipient_role. Students can only message counselors or admins.',
+                ], 422);
+            }
         }
 
         $recipientId = isset($data['recipient_id']) ? (int) $data['recipient_id'] : null;
 
-        // If a specific recipient counselor is provided, verify they are actually a counselor.
+        // If a specific recipient is provided, verify they are actually the intended role.
         if ($recipientId) {
             $recipientUser = User::find($recipientId);
-            if (! $recipientUser || ! $this->isCounselor($recipientUser)) {
+
+            if (! $recipientUser) {
+                return response()->json(['message' => 'Recipient not found.'], 422);
+            }
+
+            if ($recipientRoleInput === 'counselor' && ! $this->isCounselor($recipientUser)) {
                 return response()->json(['message' => 'Recipient is not a counselor.'], 422);
+            }
+
+            if ($recipientRoleInput === 'admin' && ! $this->isAdmin($recipientUser)) {
+                return response()->json(['message' => 'Recipient is not an admin.'], 422);
             }
         }
 
@@ -250,20 +300,36 @@ class StudentMessageController extends Controller
         $message->sender_id = (int) $user->id;
         $message->sender_name = $user->name ?? null;
 
-        $message->recipient_role = 'counselor';
-        $message->recipient_id = $recipientId; // null = office inbox; int = direct counselor
+        $message->recipient_role = $recipientRoleInput;
+        $message->recipient_id = $recipientId; // null = role inbox; int = direct recipient
 
         $message->conversation_id = $conversationId;
 
         $message->content = $data['content'];
 
-        // Student has already "read" their own outgoing message
+        // Student has already "read" their own outgoing message (student-side read flag)
         $message->is_read = true;
         $message->student_read_at = now();
 
-        // Counselor has not read it yet
-        $message->counselor_is_read = false;
-        $message->counselor_read_at = null;
+        // ✅ Recipient-side unread flags
+        // Counselor flags (existing columns expected)
+        $message->counselor_is_read = ($recipientRoleInput === 'counselor') ? false : true;
+        $message->counselor_read_at = ($recipientRoleInput === 'counselor') ? null : now();
+
+        // Admin flags (set ONLY if columns exist to avoid SQL errors)
+        if ($this->hasMessagesColumn('admin_is_read')) {
+            $message->admin_is_read = ($recipientRoleInput === 'admin') ? false : true;
+        }
+        if ($this->hasMessagesColumn('admin_read_at')) {
+            $message->admin_read_at = ($recipientRoleInput === 'admin') ? null : now();
+        }
+        // Some schemas may use alternate naming
+        if ($this->hasMessagesColumn('is_read_by_admin')) {
+            $message->is_read_by_admin = ($recipientRoleInput === 'admin') ? false : true;
+        }
+        if ($this->hasMessagesColumn('read_by_admin')) {
+            $message->read_by_admin = ($recipientRoleInput === 'admin') ? false : true;
+        }
 
         $message->save();
 
@@ -287,8 +353,8 @@ class StudentMessageController extends Controller
      *
      * - If message_ids omitted/empty => mark all as read.
      *
-     * ✅ FIXED:
-     * - Use case-insensitive sender matching so "Counselor" vs "counselor" doesn't break read status updates.
+     * ✅ UPDATED:
+     * - Also mark admin messages as read for the student.
      */
     public function markAsRead(Request $request): JsonResponse
     {
@@ -308,9 +374,8 @@ class StudentMessageController extends Controller
             ->where('user_id', $user->id)
             ->where('is_read', false);
 
-        // Typically only counselor/system messages are unread for student
-        // (Student outgoing messages are stored as is_read=true.)
-        $query->whereIn(DB::raw('LOWER(sender)'), ['counselor', 'system']);
+        // Typically only counselor/admin/system messages are unread for student
+        $query->whereIn(DB::raw('LOWER(sender)'), ['counselor', 'admin', 'system']);
 
         $messageIds = $data['message_ids'] ?? null;
 
